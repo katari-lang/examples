@@ -11,7 +11,7 @@
 
 services:
   runtime:
-    image: ghcr.io/katari-lang/katari:0.1.0-rc12
+    image: ghcr.io/katari-lang/katari:0.1.0
     restart: unless-stopped
     ports:
       # Serves BOTH the JSON API (/api/v1) and the admin console (/) — the console is baked in.
