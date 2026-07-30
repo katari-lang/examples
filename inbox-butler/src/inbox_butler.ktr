@@ -1,0 +1,462 @@
+// inbox-butler: a quiet Gmail-to-Calendar secretary. A gmail source fiber reports each newly
+// arrived mail to one sequential desk; the desk triages it with one structured model call; a mail
+// that looks like a meeting becomes a GATE fiber — a prefilled, editable form on Discord — and only
+// the operator's submit creates the calendar event. The stack, top to bottom (order is load-bearing, see
+// handler-geometry): supervisor → one attempt [ panic converter → throw converter → providers → ask adapter
+// (parallel) → nursery → spawn_gate → desk → region.watch ].
+
+import ai
+import ai.anthropic
+import discord
+import gmail
+import google_calendar
+import inbox_butler.triage
+
+@"The Discord channel the butler asks in and reports to — the REQUIRED env `BUTLER_CHANNEL`."
+agent butler_channel() -> string {
+  env.get_or(key = "BUTLER_CHANNEL", fallback = "")
+}
+
+@"The operator's IANA timezone (e.g. \"Asia/Tokyo\") — the REQUIRED env `BUTLER_TIMEZONE`, the clock
+\"tomorrow 15:00\" in a mail is resolved against. `main` refuses to start on an unresolvable one."
+agent butler_timezone() -> string {
+  env.get_or(key = "BUTLER_TIMEZONE", fallback = "")
+}
+
+// ── the interaction plane: one seam every human question goes through ─────────────────────────────
+
+@"The question reached the operator and a control completed it."
+data asked(@"Which control completed, and with what." answer: discord.answer)
+
+@"NOBODY was asked — Discord refused the post, or the runtime restarted while the question stood. A VALUE,
+because the gate that performed the ask cannot catch a throw raised above its own frame; this is how it
+fails closed."
+data not_asked(@"Why the question could not be posted, in one clause." reason: string)
+
+// What performing `ask_operator` answers with. (Type synonyms take no docs.)
+type ask_outcome = asked | not_asked
+
+@"Ask the operator one question in the butler channel and BLOCK until they complete a control —
+the seam every human decision goes through, so no gate has to know a channel."
+request ask_operator(prompt: string, controls: array[discord.control]) -> ask_outcome
+
+@"The ask adapter's body: post the question, and answer with its own failure. A refused post (`api_error`)
+and a question the runtime interrupted both become `not_asked`; `auth_error` re-raises — a dead token must
+stop the butler loudly. A connection gone STALE cannot hide in the `not_asked` arm: the very next post
+through the same handle panics where the supervisor can see it, so this never becomes a mute butler
+answering \"could not ask\" forever."
+agent guarded_ask(prompt: string, controls: array[discord.control]) -> ask_outcome with discord.connection | io | prelude.throw[discord.auth_error] {
+  // A panic is not a throw, and TWO shapes of it land here — this body runs on the CONTINUATION, above every
+  // gate. (1) The at-most-once interruption of a pending ask: nobody answered, so `not_asked` is the honest
+  // value, and folding it keeps one unanswered dialog from ending the butler. (2) A sidecar handle gone stale
+  // (the dead one a cold restart replays): NOT told apart here, deliberately — sniffing a panic message would
+  // be the ad-hoc branch, and it does not need telling apart, because every other post through that handle
+  // panics too and those run on the continuation, where the supervisor rebuilds the connection.
+  use handler {
+    request panic(msg: string) {
+      break not_asked(reason = f"the question never reached the operator — the runtime restarted while it was in front of them (${msg}), and an interrupted call is never re-run, so nothing was approved")
+    }
+  }
+  use handler {
+    request prelude.throw(error: discord.discord_error) -> never {
+      match (error) {
+        case discord.api_error(message => text) -> { break not_asked(reason = f"Discord refused the question (${text})") }
+        case rest -> { prelude.throw(error = rest) }
+      }
+    }
+  }
+  asked(answer = discord.ask(channel = butler_channel(), prompt = prompt, controls = controls))
+}
+
+@"The operator's decision, READ: create at @values@ — the form as submitted, not the proposal."
+data granted(@"Every declared field's text as submitted." values: record[string])
+
+@"The operator's decision, READ: nothing is created."
+data refused(@"Why not, in one clause." reason: string)
+
+// One gate's outcome, read from the answer once. (Type synonyms take no docs.)
+type decision = granted | refused
+
+@"One submitted box's text, or @fallback@ when the box came back BLANK — the rule for an auxiliary
+box. Every declared field is present in @values@, so the missing-key arm is the same fallback."
+agent kept_text(values: record[string], key: string, fallback: string) -> string {
+  match (record.get(target = values, key = key)) {
+    case null -> fallback
+    case text -> if (string.is_blank(value = text)) { fallback } else { text }
+  }
+}
+
+@"Read the form's answer into the decision sum: a submit whose TITLE box still holds text is
+`granted`; a cleared title (the event's substance), the skip button, or any other control is `refused`."
+agent read_answer(answer: discord.answer) -> decision {
+  match (answer) {
+    case discord.submitted(id => _, values => values, by => _, display_name => _) -> {
+      if (string.is_blank(value = kept_text(values = values, key = "title", fallback = ""))) {
+        refused(reason = "the operator cleared the title — an emptied draft reads as 'do not create this'")
+      } else {
+        granted(values = values)
+      }
+    }
+    case rest -> refused(reason = "the operator skipped it")
+  }
+}
+
+@"Post one line to the butler channel without letting a failed post kill the caller. `dropped` folds
+to null deliberately — this channel IS the reporting surface, so the line has no second audience."
+agent report(text: string) -> null with discord.connection | io | prelude.throw[discord.auth_error] {
+  match (discord.try_send(channel = butler_channel(), text = discord.fit_message(text = text, marker = "… (cut to fit one Discord message)"))) {
+    case discord.delivered() -> null
+    case discord.dropped(reason => _) -> null
+  }
+}
+
+// ── the gate: fork, ask, one dispatch ─────────────────────────────────────────────────────────────
+
+@"The session nursery's scope marker — one nullary phantom per nursery, per `region`'s rule."
+effect butler_scope
+
+// What a GATE fiber may do: ask, then act. The throws are the non-self-healing failures a gate
+// re-raises; surfaced at the watch, they end the run loudly. (Type synonyms take no docs.)
+type gate_ceiling = ask_operator | google_calendar.credential | discord.connection | io | prelude.throw[http.auth_error | discord.auth_error]
+
+// What the MAIL SOURCE fiber may do; the store pair is the watch's durable cursor. (No docs.)
+type source_ceiling = mail_arrived | gmail.credential | store.get | store.set | io
+
+// The nursery's ceiling: the union of its fiber kinds; each fork stays bounded by its request's row.
+type bus_ceiling = gate_ceiling | source_ceiling
+
+@"FORK a gate: run @task@ — one mail's whole question-and-consequence — as a fiber and answer AT ONCE, so the desk keeps triaging while the operator takes their time."
+request spawn_gate(
+  @"The gate's fiber name; prefixed `gate:` so a roster line reads as a pending question." name: string,
+  @"The whole gate: ask the operator, then act on exactly what they answered." task: agent (input: null) -> null with gate_ceiling,
+) -> null
+
+@"Create the event EXACTLY as the operator submitted it, answering the one line the channel gets —
+the created link, or the typed failure (the guard converts rather than hides; `auth_error`
+re-raises). Fail-closed: any box this cannot read creates NOTHING and says why."
+agent create_as_submitted(values: record[string], start_fallback: string, duration_fallback: integer, subject: string, note: string) -> string with google_calendar.credential | io | prelude.throw[http.auth_error] {
+  use handler {
+    request prelude.throw(error: http.api_failure | http.fetch_error | json.parse_error) -> never {
+      match (error) {
+        case http.auth_error(status => status, context => context, message => text) -> { prelude.throw(error = http.auth_error(status = status, context = context, message = text)) }
+        case rest -> { break f"(creating the event FAILED: ${json.stringify(value = rest)}. The calendar was NOT changed — the mail is still in your inbox.)" }
+      }
+    }
+  }
+  let title = kept_text(values = values, key = "title", fallback = "")
+  let start_text = string.trim(value = kept_text(values = values, key = "start", fallback = start_fallback))
+  let duration_text = string.trim(value = kept_text(values = values, key = "duration", fallback = string.to_string(value = duration_fallback)))
+  // The location box's label says "blank = none": its emptiness is a decision, so no `kept_text`.
+  let location = match (record.get(target = values, key = "location")) {
+    case null -> ""
+    case text -> string.trim(value = text)
+  }
+  match (time.from_rfc3339(value = start_text)) {
+    case null -> f"(no event was created: the start box read \"${start_text}\", which is not an RFC3339 timestamp with an offset.)"
+    case start_milliseconds -> {
+      match (string.to_integer(value = duration_text)) {
+        case null -> f"(no event was created: the duration box read \"${duration_text}\", which is not a whole number of minutes.)"
+        case minutes -> {
+          // The UTC arm names the SAME instant (main refused unresolvable zones): it respells, never moves.
+          let offset = match (time.zone_offset(epoch_milliseconds = start_milliseconds, zone = butler_timezone())) {
+            case null -> 0
+            case resolved -> resolved
+          }
+          // The calendar package's event carries no location field, so the place rides the description.
+          let location_line = if (string.is_blank(value = location)) { "" } else { f"Location: ${location}\n" }
+          let created = google_calendar.create_event(
+            calendar_id = env.get_or(key = "CALENDAR_ID", fallback = "primary"),
+            summary = title,
+            start = start_text,
+            end = time.to_rfc3339(epoch_milliseconds = start_milliseconds + minutes * 60000, offset_minutes = offset),
+            description = f"${location_line}Proposed by inbox-butler from the mail \"${subject}\". ${note}",
+          )
+          f"(created: ${created.summary} — ${created.start} → ${created.end} — ${created.html_link})"
+        }
+      }
+    }
+  }
+}
+
+@"One mail's gate, whole: put the prefilled draft in front of the operator, then act on exactly what
+came back, in one place. A skip is quiet (the operator said no and knows it); an UNPOSTABLE question
+is loud, because that silence would mean events silently never offered."
+agent event_gate(sender: string, subject: string, candidate: triage.event_candidate) -> null with gate_ceiling {
+  let location_note = if (string.is_blank(value = candidate.location)) { "" } else { f" at ${candidate.location}" }
+  // The essentials lead and the model's prose trails: a cut never costs the decision its facts.
+  let prompt = discord.fit_message(
+    text = f"Mail from ${sender} — \"${subject}\" looks like it wants a meeting: ${candidate.note}\nProposed: ${candidate.title} — ${candidate.start_rfc3339}, ${string.to_string(value = candidate.duration_minutes)} min${location_note}.\nOpen \"edit & create\" to fix any field before it lands, or skip.",
+    marker = "… (cut; the form holds the full values)",
+  )
+  let outcome = ask_operator(prompt = prompt, controls = [
+    discord.form(id = "event", label = "edit & create", title = "calendar event", fields = [
+      discord.field(id = "title", label = "title (blank = do not create)", value = candidate.title),
+      discord.field(id = "start", label = "start (RFC3339, with offset)", value = candidate.start_rfc3339),
+      discord.field(id = "duration", label = "duration (minutes)", value = string.to_string(value = candidate.duration_minutes)),
+      discord.field(id = "location", label = "location (blank = none)", value = candidate.location),
+    ]),
+    discord.button(id = "skip", label = "skip"),
+  ])
+  match (outcome) {
+    case not_asked(reason => reason) -> report(text = f"(could not ask about \"${subject}\": ${reason}. No event was created; the mail is still in your inbox.)")
+    case asked(answer => answer) -> {
+      match (read_answer(answer = answer)) {
+        case refused(reason => _) -> null
+        case granted(values => values) -> report(text = create_as_submitted(
+          values = values,
+          start_fallback = candidate.start_rfc3339,
+          duration_fallback = candidate.duration_minutes,
+          subject = subject,
+          note = candidate.note,
+        ))
+      }
+    }
+  }
+}
+
+// ── the desk and its source ───────────────────────────────────────────────────────────────────────
+
+@"Report one newly arrived mail to the desk — the source fiber's only voice."
+request mail_arrived(message: gmail.message) -> null
+
+@"The desk's body for one mail: dedup, triage, dispatch. `gmail.watch` delivers AT LEAST once, so
+exactly-once is built at the destination — a durable marker keyed on the message id, set BEFORE the
+model call, so a redelivered mail costs neither a second model step nor a second question. The price is
+paid knowingly: a mail whose triage failed is reported once and never tried again, and one the run died in
+the middle of is skipped when it starts back up — either way the mail is untouched in the inbox."
+agent handle_mail(message: gmail.message) -> null with spawn_gate | gmail.credential | ai.infer_object | discord.connection | store.get | store.set | io | prelude.throw[http.auth_error | discord.auth_error] {
+  match (store.get(key = f"inbox_butler/handled/${message.id}")) {
+    case store.found(value => _) -> null
+    case store.absent(key => _) -> {
+      store.set(key = f"inbox_butler/handled/${message.id}", value = true)
+      match (triage.triage_mail(message = message, zone = butler_timezone())) {
+        // Not a meeting: no message at all — the butler is quiet by design.
+        case triage.not_event() -> null
+        case triage.triage_failed(reason => reason) -> report(text = f"(could not triage \"${message.subject}\" from ${message.sender}: ${reason}. It stays in your inbox and the butler will not try again — read it yourself.)")
+        // The residual arm is exactly `event_candidate`, bound whole. The gate is a FORK so the
+        // desk keeps triaging while this question waits on a human.
+        case candidate -> {
+          agent decide(input: null) -> null with gate_ceiling {
+            event_gate(sender = message.sender, subject = message.subject, candidate = candidate)
+          }
+          spawn_gate(name = f"gate:mail:${message.id}", task = decide)
+        }
+      }
+    }
+  }
+}
+
+@"The mail source's whole body: watch the mailbox and report each arrival. Resilience is the
+converter idiom AROUND the watch: poll failures — `http.auth_error` included, the gmail package's own
+prescription, since a re-run re-resolves the token and a credential needing a human PARKS on its
+authorize escalation — become `replay.interrupted`, re-running the watch after a capped backoff.
+The cursor is durable, so a restart delivers the downtime instead of skipping it."
+agent mail_source(input: null) -> null with source_ceiling {
+  use replay.forever(initial_delay_milliseconds = 5000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+  use handler {
+    request prelude.throw(error: http.api_failure | http.fetch_error | json.parse_error) -> never {
+      replay.interrupted(failure = error)
+    }
+  }
+  agent deliver(value: gmail.message) -> null with mail_arrived {
+    mail_arrived(message = value)
+  }
+  gmail.watch(
+    query = env.get_or(key = "GMAIL_QUERY", fallback = "in:inbox"),
+    poll_interval_milliseconds = env.get_integer_or(key = "GMAIL_POLL_MINUTES", fallback = 5) * 60000,
+    cursor_at = poll.resume(key = "inbox_butler/gmail_cursor"),
+    deliver_to = deliver,
+  )
+}
+
+// ── the resident: one policy for failure, one supervisor ──────────────────────────────────────────
+
+@"The verdict on one failure: nothing heals it — a rejected credential, an unset secret — so stop loudly."
+data must_stop(@"The failure, re-raised as bound rather than rebuilt." error: unknown)
+
+@"The verdict on one failure: another go is worth it — a token endpoint that blipped, a 5xx, the unforeseen."
+data worth_retrying(@"The failure, for the line the operator reads." error: unknown)
+
+// One failure, classified. (Type synonyms take no docs.)
+type verdict = must_stop | worth_retrying
+
+@"The mail source's fiber died: a butler with no watch hears nothing ever again, so this ends the ATTEMPT and
+lets the supervisor fork a fresh watch. Thrown rather than reported, because a report about a deaf butler
+leaves one running."
+data source_died(@"The panic the source died with." message: string)
+
+@"Classify one failure — THE one place the unhealable set is named, so a fiber's report and the supervisor's
+restart cannot drift apart on what \"fatal\" means."
+agent classify(error: unknown) -> verdict {
+  match (error) {
+    case http.auth_error(status => _, context => _, message => _) -> must_stop(error = error)
+    case discord.auth_error(message => _) -> must_stop(error = error)
+    case env.missing_secret(key => _, message => _) -> must_stop(error = error)
+    case rest -> worth_retrying(error = rest)
+  }
+}
+
+@"ONE ATTEMPT at the resident: install the providers and the handler stack in its load-bearing order, fork
+the mail source, pump the region. The ask adapter is FIRST and PARALLEL, so several gates can wait at once.
+The PROVIDERS SIT INSIDE the attempt, which is what makes a restart work at all: a sidecar's client handle
+is process-local, so the handle a cold restart replays names a connection that no longer exists, and only a
+fresh `discord.provider` mints a live one (the ffi-sidecars guide, \"Survive a runtime restart\"). Ends by
+RETURNING the reason to start over from; what cannot heal re-raises PAST the supervisor instead."
+agent session() -> ai.crash_reason with store.get | store.set | io | prelude.throw[unknown] {
+  // A PANIC IS NOT A THROW, and after a cold restart it is the ORDINARY case rather than a defect: every FFI
+  // handle the journal replays is dead, so this attempt's first Discord call panics. Returned as a reason,
+  // the next attempt reconnects. A real defect rides the same road, announced on every restart — loud
+  // without being fatal, which is the trade a resident wants.
+  use handler { request panic(msg: string) { break ai.crash_reason(kind = "panic", detail = f"panic: ${msg}") } }
+  // The THROW policy, on the ONE classifier: what cannot heal re-raises past the supervisor to `main`'s fatal
+  // sink, and everything else is the reason the next attempt starts from.
+  use handler {
+    request prelude.throw(error: unknown) -> never {
+      match (classify(error = error)) {
+        case must_stop(error => fatal) -> { prelude.throw(error = fatal) }
+        case worth_retrying(error => rest) -> {
+          // The KIND is the value's own constructor name — all the supervisor COMPARES — so a standing outage
+          // counts as one repeat instead of resetting the backoff on every reworded message.
+          let kind = match (reflection.constructor_of(value = rest)) {
+            case null -> "crash"
+            case name -> name
+          }
+          break ai.crash_reason(kind = kind, detail = json.stringify(value = rest))
+        }
+      }
+    }
+  }
+  use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
+  use anthropic.provider(source = credentials.env(key = "ANTHROPIC_API_KEY"))
+  use gmail.provider(source = credentials.oauth(name = "google"))
+  use google_calendar.provider(source = credentials.oauth(name = "google"))
+  // One line per attempt, earning its place twice: it says the butler is up, and as the attempt's FIRST
+  // Discord call it is where a cold restart's dead handle is found — while no mail is at stake, rather than on
+  // the first question the desk wanted to ask (which that mail would then never get).
+  report(text = "(watching your inbox)")
+  use parallel handler {
+    request ask_operator(prompt: string, controls: array[discord.control]) {
+      next guarded_ask(prompt = prompt, controls = controls)
+    }
+  }
+  let nursery = use region.provide[butler_scope, bus_ceiling]
+  use handler {
+    request spawn_gate(name: string, task: agent (input: null) -> null with gate_ceiling) {
+      let _handle = region.fork(nursery = nursery, task = task, argument = null, name = name)
+      next null
+    }
+  }
+  // The source's name, spelled ONCE: the fork tags by it and the crashed clause reads it back.
+  let source_name = "source:gmail"
+  // ONE sequential block, three clauses: the desk, and the two endings a fiber cannot report itself.
+  use handler {
+    request mail_arrived(message: gmail.message) {
+      next handle_mail(message = message)
+    }
+    request region.crashed(id: string, name: string, message: string) {
+      // A panic is a defect, and WHOSE fiber it was decides the cost. One gate's defect is one lost question.
+      // The source's death is the butler going deaf, which no report fixes — so it ends the attempt and the
+      // supervisor forks a fresh watch (re-forking here would inherit this attempt's dead sidecar handles).
+      if (name == source_name) {
+        prelude.throw(error = source_died(message = message))
+      } else {
+        next report(text = f"(fiber ${name} crashed: ${message} — a defect worth reporting. The butler keeps running.)")
+      }
+    }
+    request region.failed(id: string, name: string, error: unknown) {
+      // One escaped failure, judged by the same classifier the attempt itself uses: what cannot heal ends the
+      // RUN, loudly (absorbed, it would leave a butler that looks alive and does nothing), and one errand's bad
+      // luck is one line — this desk keeps its other mail and the other gates keep their questions.
+      match (classify(error = error)) {
+        case must_stop(error => fatal) -> { prelude.throw(error = fatal) }
+        case worth_retrying(error => rest) -> { next report(text = f"(${name} failed: ${json.stringify(value = rest)}. That errand did not complete; the butler keeps running.)") }
+      }
+    }
+  }
+  let _source = region.fork(nursery = nursery, task = mail_source, argument = null, name = source_name)
+  region.watch(nursery = nursery)
+}
+
+@"Say that the butler restarted, through a connection of its OWN: the attempt's connection died with the
+attempt, and a resident that reboots in silence looks exactly like one that is working. A repeat shrinks to
+one line carrying its streak — nobody needs the same sentence every quarter hour — and a notice that cannot
+be posted is DROPPED at every level, because a crash report must never be the thing that ends the butler."
+agent restart_notice(event: ai.restart_event) -> null with io {
+  use handler { request panic(msg: string) { break null } }
+  use handler { request prelude.throw(error: unknown) -> never { break null } }
+  use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
+  match (event) {
+    case ai.first_failure(reason => reason) -> report(text = f"(the butler stopped on ${reason.detail} and is starting over with a fresh connection. A question left waiting here is dead now — it reads \"(expired)\" and is not asked again — but its mail is still in your inbox, and the cursor is durable, so nothing that arrives meanwhile is skipped.)")
+    case ai.repeated_failure(reason => _, streak => streak) -> report(text = f"(still failing the same way — ${string.to_string(value = streak)} attempts in a row now. The butler keeps trying, more slowly each time.)")
+  }
+}
+
+@"Resolve every required credential in one pass: \"\" when all resolve, else one console line NAMING
+every missing secret at once. The `google` OAuth check is also where an unauthorized credential
+PARKS on its authorize escalation — the browser login happens at deploy, not mid-run."
+agent preflight_credentials() -> string with io | prelude.throw[oauth.server_error] {
+  use handler {
+    request prelude.throw(error: credentials.unresolved | oauth.server_error) -> never {
+      match (error) {
+        case credentials.unresolved(names => names) -> { break f"failed: these required secrets are unset: ${string.join(parts = names, separator = ", ")} — set each with `katari env set <NAME> --secret` (see the README) and run again." }
+        case rest -> { prelude.throw(error = rest) }
+      }
+    }
+  }
+  let _resolved = credentials.preflight(sources = [
+    credentials.env(key = "DISCORD_TOKEN"),
+    credentials.env(key = "ANTHROPIC_API_KEY"),
+    credentials.oauth(name = "google"),
+  ])
+  ""
+}
+
+@"The one-time liveness probe: mint a connection, post the online line with `send_message` — NOT `try_send` —
+and let it close again, so a typo'd channel id or a token Discord rejects (preflight proved it is SET, not
+accepted) fails HERE as a console line instead of a silently swallowed drop on every post. Its own provider,
+because it runs BEFORE the supervisor: an attempt's connection belongs to that attempt, and this is the one
+check that must fail while the operator is still watching the console."
+agent boot_probe() -> string with io {
+  use handler {
+    request prelude.throw(error: unknown) -> never { break f"failed: could not post to BUTLER_CHANNEL — the token, the channel id or the bot's access to that channel is wrong (${json.stringify(value = error)}). Fix it and run again." }
+  }
+  use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
+  let _id = discord.send_message(channel = butler_channel(), text = f"(inbox-butler online — clock ${butler_timezone()})")
+  ""
+}
+
+@"Entry: run the inbox butler as a resident — refusing to start on a missing channel, an unresolvable
+timezone, a missing credential or an unpostable channel, each as one clear console line. Past the boot the
+supervisor keeps it up: a failure another go could get past — a token endpoint that blipped, the dead sidecar
+handles a cold restart replays — starts a fresh attempt and says so in the channel, while a rejected
+credential ends the run with a `fatal:` line, because no backoff heals one. Neither costs you mail: the gmail
+cursor is durable. Run: katari run inbox_butler.main --detach"
+agent main() -> string {
+  use handler { request panic(msg: string) { break f"failed: ${msg}" } }
+  // The fatal sink: everything the resident re-raises as unhealable becomes one console line.
+  use handler {
+    request prelude.throw(error: unknown) -> never {
+      break f"fatal: ${json.stringify(value = error)}"
+    }
+  }
+  match (butler_channel()) {
+    case "" -> { return "failed: the non-secret env BUTLER_CHANNEL must be set — `katari env set BUTLER_CHANNEL <channel id>` — and the bot must be able to post there." }
+    case _configured -> null
+  }
+  match (time.zone_offset(epoch_milliseconds = time.now(), zone = butler_timezone())) {
+    case null -> { return f"failed: BUTLER_TIMEZONE is \"${butler_timezone()}\", which the runtime cannot resolve. Set an IANA zone name — `katari env set BUTLER_TIMEZONE Asia/Tokyo` — and run again." }
+    case _offset -> null
+  }
+  match (preflight_credentials()) {
+    case "" -> null
+    case failure -> { return failure }
+  }
+  match (boot_probe()) {
+    case "" -> null
+    case failure -> { return failure }
+  }
+  // THE SUPERVISOR: one attempt at a time, restarted on every reason an attempt hands back. Its cadence is
+  // the package's default — 30 seconds, doubling to a quarter of an hour while the SAME failure repeats, back
+  // to the floor when it changes — and the fatal line stays with `session`, which re-raises past this loop.
+  ai.supervise(session = session, on_restart = restart_notice)
+}

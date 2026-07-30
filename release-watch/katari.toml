@@ -1,0 +1,11 @@
+[package]
+name = "release_watch"
+description = "A GitHub release monitor managed from Discord: watch/unwatch repositories in a channel, get new releases announced on a durable schedule."
+
+[runtime]
+url = "http://localhost:3000"
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "snapshot-2026-07-29-56e87e45"
+packages = ["web", "discord", "fleet"]

@@ -1,0 +1,38 @@
+# Every example must compile against exactly what it pins: the published CLI from npm and the
+# registry snapshot in its committed katari.lock. A green run here is the promise the README
+# makes — clone, lock, check — kept by CI instead of by hope.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [release-watch, standup-scribe, concierge, inbox-butler]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The examples track the CLI release line; `latest` is the same tag the READMEs install.
+      - name: Install the published CLI
+        run: npm install -g @katari-lang/cli
+
+      # `lock` refetches the pinned package tarballs into the local cache and asserts the
+      # committed katari.lock still matches katari.toml; `check` then compiles offline.
+      - name: Lock and check
+        working-directory: ${{ matrix.example }}
+        run: |
+          katari lock
+          katari check

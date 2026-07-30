@@ -1,0 +1,11 @@
+[package]
+name = "concierge"
+description = "A two-desk Discord concierge: a public face that answers only from notes its owner publishes from a private control channel."
+
+[runtime]
+url = "http://localhost:3000"
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "snapshot-2026-07-29-56e87e45"
+packages = ["discord", "ai", "memory"]

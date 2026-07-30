@@ -1,0 +1,101 @@
+// The string boundary of the control channel: raw Discord text becomes a `command` value HERE and
+// nowhere else, so everything behind this module dispatches on the sum instead of re-reading text.
+
+@"One GitHub repository, as the two path segments its releases API is addressed by — the durable
+watch spec `fleet` stores: exactly what the operator typed, split once and never re-parsed."
+data repository_spec(
+  @"The repository owner — the segment before the slash, exactly as typed." owner: string,
+  @"The repository name — the segment after the slash, exactly as typed." name: string,
+)
+
+@"Start watching a repository for new releases."
+data watch_requested(@"The repository to watch." repository: repository_spec)
+
+@"Stop watching a repository."
+data unwatch_requested(@"The repository to stop watching." repository: repository_spec)
+
+@"Show every watched repository with its cursor and last check outcome."
+data list_requested()
+
+@"The message was not a well-formed command: reply with usage, led by @note@ when something
+specific was wrong."
+data help_requested(@"What was wrong, or empty for a plain usage reply." note: string)
+
+// Everything the control desk can be asked to do. (Type synonyms take no docs.)
+type command = watch_requested | unwatch_requested | list_requested | help_requested
+
+@"A repository rendered the way the operator wrote it — the one spelling every reply uses."
+agent render_repository(repository: repository_spec) -> string {
+  f"${repository.owner}/${repository.name}"
+}
+
+@"A message split into its space- or newline-separated words — the one place raw spacing is forgiven."
+agent words(text: string) -> array[string] {
+  let spaced = string.replace(value = text, search = "\n", replacement = " ")
+  array.filter(target = string.split(value = spaced, separator = " "), keep = agent (value: string) -> boolean { !string.is_blank(value = value) })
+}
+
+@"The word at @index@, trimmed, or empty past the end — total, so no caller branches on bounds."
+agent word_at(parts: array[string], index: integer) -> string {
+  match (array.get(target = parts, index = index)) {
+    case null -> ""
+    case part -> string.trim(value = part)
+  }
+}
+
+@"Read \"owner/name\" into a `repository_spec`, or `null`: exactly one slash, both segments
+non-blank. Nothing subtler is judged on purpose — a well-shaped but wrong name is answered by
+GitHub's own 404 on the first check, which `list` then shows."
+agent parse_repository(text: string) -> repository_spec | null {
+  let segments = string.split(value = text, separator = "/")
+  let owner = word_at(parts = segments, index = 0)
+  let name = word_at(parts = segments, index = 1)
+  if (array.length(target = segments) != 2 || string.is_blank(value = owner) || string.is_blank(value = name)) {
+    null
+  } else {
+    repository_spec(owner = owner, name = name)
+  }
+}
+
+@"The `watch` / `unwatch` argument shape, judged once for both verbs: exactly one argument, and it
+reads as owner/name — else `null`, which the caller words per verb."
+agent repository_argument(parts: array[string]) -> repository_spec | null {
+  if (array.length(target = parts) == 2) { parse_repository(text = word_at(parts = parts, index = 1)) } else { null }
+}
+
+@"The corrective note for a malformed `watch` / `unwatch`, worded once for both verbs."
+agent usage_note(verb: string) -> help_requested {
+  help_requested(note = f"`${verb}` takes exactly one `owner/name` argument.")
+}
+
+@"Parse one channel message into a `command`, TOTALLY: three verbs (case-insensitive), everything
+else folded into `help_requested` — the catch-all keeps the desk total over an unbounded string set."
+agent parse_command(text: string) -> command {
+  let parts = words(text = text)
+  match (string.to_lower(value = word_at(parts = parts, index = 0))) {
+    case "watch" -> {
+      match (repository_argument(parts = parts)) {
+        case null -> usage_note(verb = "watch")
+        case repository -> watch_requested(repository = repository)
+      }
+    }
+    case "unwatch" -> {
+      match (repository_argument(parts = parts)) {
+        case null -> usage_note(verb = "unwatch")
+        case repository -> unwatch_requested(repository = repository)
+      }
+    }
+    case "list" -> if (array.length(target = parts) == 1) { list_requested() } else { help_requested(note = "`list` takes no arguments.") }
+    case _ -> help_requested(note = "")
+  }
+}
+
+@"The usage reply — the only text sent for anything that is not a command."
+agent help_text() -> string {
+  string.join(parts = [
+    "I watch GitHub repositories for new releases. Commands:",
+    "`watch owner/name` — start watching (only releases published after this are announced).",
+    "`unwatch owner/name` — stop watching.",
+    "`list` — every watch, its last announced tag, and its last check outcome.",
+  ], separator = "\n")
+}

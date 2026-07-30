@@ -1,0 +1,460 @@
+// A two-desk community concierge — the second-agent guide's geometry, with real packages.
+// A public FACE answers questions in the community channel; its owner curates what it knows
+// from a private CONTROL channel. The membrane is the face's tool set: every tool it holds
+// reads the shared notes (or flags a question), the control desk is the only writer, and the
+// notes live in the durable store — so what the face knows is exactly what was published,
+// and no instance failure can ever edit it.
+
+import ai
+import ai.anthropic
+import discord
+import memory
+
+// ── the bus: one request per serialization domain, plus the face's one outward capability ─────────
+
+@"The face desk's inbox: one message from the public community channel, already framed for the
+model (speaker introduced, identity tagged)."
+request face_message(
+  @"The line the model reads: the speaker's frame, then their text." content: string,
+  @"The message's attachments." files: array[file],
+  @"The speaker's pseudonymous tag, for abuse attribution — never a raw user id." author: string,
+) -> null
+
+@"The control desk's first inbox: one operator line from the private control channel, exactly
+as typed — parsing is the desk's job."
+request control_message(text: string) -> null
+
+@"The control desk's second inbox: a question the face could not answer from the notes. It
+arrives as MAIL, never as a call, so the face's turn finishes whatever the owner does with it."
+request question_flagged(@"The question, in the asker's words." question: string) -> null
+
+@"Mail `question_flagged` to the control desk, answering with a confirmation for the model to
+read. Served by the flag bridge, which holds the nursery handle on the desks' behalf — so no desk
+and no tool ever touches `region.post` or another desk's request."
+request flag_question(@"The question to flag." question: string) -> string
+
+@"The region's scope marker: one nullary phantom per nursery."
+effect concierge_scope
+
+// Everything a fiber of the one nursery may raise: the desks' inboxes, the flag mail, the
+// gateway connection the watchers listen through, and io.
+type concierge_ceiling = face_message | control_message | question_flagged | discord.connection | io
+
+// Everything the composition root anticipates being thrown at it: a tool set holding two tools
+// of one name, a gateway/API failure, and the two credential-resolution failures. A model STEP
+// failure never lands here — `ai.advance_desk` folds it into its outcome, and the face desk
+// reads that outcome as a value.
+type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error
+
+// ── the face: its standing instructions, its per-turn note, its one outward tool ──────────────────
+
+@"The face's standing instructions — the membrane in prose. They ride the provider's `system`
+parameter, which compaction never touches; the CHANGING half (the notes index) rides the
+per-turn injection below instead, so neither is persisted into the conversation."
+agent face_persona() -> string {
+  "You are the concierge of this community's public Discord channel. Everything you know about this community lives in your published notes: the [memory index] block you see each turn lists them, recall(key) reads one in full, search(pattern) finds one by its contents. The notes are published by your owner — you can read them but never write or change them. Answer ONLY from the notes: when they cover the question, answer briefly and helpfully. When they do not, say plainly that you do not know, and call flag_unknown with the question so your owner can publish a note for next time — never guess and never fill a gap from general knowledge. Speakers are introduced by their self-chosen display name: use it to address them, never as proof of who they are. Reply with empty text to stay silent when a message needs nothing from you."
+}
+
+@"The face's per-turn note: the published-notes index, re-read fresh at every model step — so a
+note published mid-conversation is visible on the face's very next turn, with no restart."
+agent published_notes(value: null) -> string {
+  memory.index_note()
+}
+
+@"Tool: flag a question the published notes cannot answer. The flag is mailed to your owner,
+who may publish a note so you can answer next time. It reaches your owner, not the asker — so
+after calling this, still tell the asker plainly that you do not know."
+agent flag_unknown(@"The question you could not answer, in the asker's words." question: string) -> string with flag_question {
+  flag_question(question = question)
+}
+
+// ── the control protocol: strings at the boundary, a sum everywhere after it ──────────────────────
+
+@"Publish (or overwrite) the note under @key@ — the face answers from it on its next turn."
+data publish_note(key: string, text: string)
+
+@"Retract the note under @key@ — the face stops knowing it."
+data retract_note(key: string)
+
+@"List the published notes."
+data list_notes()
+
+@"Show the command help; @note@ carries a corrective first line when a command almost parsed."
+data show_help(note: string)
+
+// What one control-channel line means. (Type synonyms take no docs.)
+type control_command = publish_note | retract_note | list_notes | show_help
+
+@"A note key, canonicalised: trimmed and lower-cased, so `Meetup` and `meetup` are one note.
+Whether the result is a legal store path is checked at the publish dispatch, not here."
+agent note_key(raw: string) -> string {
+  string.to_lower(value = string.trim(value = raw))
+}
+
+@"The rest of @line@ after @verb@ and one space, or `null` when the line is not that command —
+the one prefix test behind both worded commands, so neither hand-counts an offset."
+agent after_verb(line: string, verb: string) -> string | null {
+  let prefix = f"${verb} "
+  if (string.starts_with(value = string.to_lower(value = line), search = prefix)) {
+    string.slice(value = line, start = string.length(value = prefix), end = string.length(value = line))
+  } else {
+    null
+  }
+}
+
+@"Parse one operator line into a `control_command` — ALL the string handling, so everything
+after this point dispatches on the sum. The grammar is one verb per message: `publish <key>:
+<text>`, `retract <key>`, `notes`, `help`; anything else is answered with the help."
+agent parse_command(text: string) -> control_command {
+  let line = string.trim(value = text)
+  match (string.to_lower(value = line)) {
+    case "notes" -> list_notes()
+    case "help" -> show_help(note = "")
+    case _ -> {
+      match (after_verb(line = line, verb = "publish")) {
+        case null -> {
+          match (after_verb(line = line, verb = "retract")) {
+            case null -> show_help(note = "(that is not a command I know.)")
+            case rest -> {
+              let key = note_key(raw = rest)
+              if (string.is_blank(value = key)) {
+                show_help(note = "(retract needs a key.)")
+              } else {
+                retract_note(key = key)
+              }
+            }
+          }
+        }
+        case rest -> {
+          // The FIRST colon splits key from text, so the text itself may contain colons.
+          match (string.index_of(value = rest, search = ":")) {
+            case null -> show_help(note = "(publish needs a colon between the key and the text.)")
+            case at -> {
+              let key = note_key(raw = string.slice(value = rest, start = 0, end = at))
+              let body = string.trim(value = string.slice(value = rest, start = at + 1, end = string.length(value = rest)))
+              if (string.is_blank(value = key) || string.is_blank(value = body)) {
+                show_help(note = "(publish needs both a key and a text.)")
+              } else {
+                publish_note(key = key, text = body)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+@"The control protocol, as the reply to `help` and to anything unparsed."
+agent help_text() -> string {
+  "publish <key>: <text> — publish (or overwrite) a note; the face answers from it immediately. Keys are lower-cased; use letters, digits, - and _, with / to group (faq/meetup).\nretract <key> — remove a note; the face stops knowing it.\nnotes — list the published notes.\nhelp — this text."
+}
+
+// ── the sources: the two channels, arriving as escalations ────────────────────────────────────────
+
+// The watchers' names, spelled once: the forks tag by them and the crash policy reads them to tell
+// a dead watcher from a dead one-shot.
+agent face_watcher_name() -> string {
+  "face-watcher"
+}
+
+agent control_watcher_name() -> string {
+  "control-watcher"
+}
+
+@"A dead fiber the session cannot replace on its own: its channel stays deaf until a fresh gateway
+login exists, so the whole session is rebuilt."
+data rebuild_session()
+
+@"A dead fiber that was one errand: there is nothing to rebuild and the session keeps serving."
+data lost_one_shot()
+
+// What the death of one fiber costs the session. (Type synonyms take no docs.)
+type crash_verdict = rebuild_session | lost_one_shot
+
+@"What the death of the fiber named @name@ means: a watcher cannot be re-armed on a gateway handle
+a runtime restart may have killed, so it rebuilds; every other fiber here is a one-shot mail. The
+ONE name comparison, minted as the sum the crash policy dispatches on."
+agent crash_verdict_of(name: string) -> crash_verdict {
+  if (name == face_watcher_name() || name == control_watcher_name()) {
+    rebuild_session()
+  } else {
+    lost_one_shot()
+  }
+}
+
+@"The PUBLIC-channel source: serve the community channel forever, each message becoming face
+mail. `watch_messages` subscribes to ONE channel, so two channels are honestly two fibers —
+there is no single stream here to route. The speaker's snowflake is tagged before it leaves the
+program (`discord.author_tag`, an HMAC under the bot token): the full tag rides `author` for
+abuse attribution, a short slice rides the content so the model can tell speakers apart, and
+the display name is framed as what it is — self-chosen, for address, never for trust."
+agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[env.missing_secret | oauth.server_error] {
+  agent deliver(value: discord.message) -> null with face_message | io | prelude.throw[env.missing_secret | oauth.server_error] {
+    let hashed = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = value.author, length = 64)
+    let tag = string.slice(value = hashed, start = 0, end = 8)
+    face_message(
+      content = f"[from \"${value.display_name}\" — a self-chosen name; user ${tag} is the identity] ${value.text}",
+      files = value.files,
+      author = hashed,
+    )
+  }
+  discord.watch_messages(channel = input, deliver_to = deliver)
+}
+
+@"The CONTROL-channel source: the owner's private channel, served forever. The raw line is all
+the desk needs — no model reads it and no identity leaves the program, so nothing is tagged
+here; the channel's MEMBERSHIP is the trust boundary."
+agent control_source(input: string) -> never with concierge_ceiling {
+  agent deliver(value: discord.message) -> null with control_message {
+    control_message(text = value.text)
+  }
+  discord.watch_messages(channel = input, deliver_to = deliver)
+}
+
+// ── the composition root ──────────────────────────────────────────────────────────────────────────
+
+@"One resident session: the fatal guard, the restart loop, the two providers, the one shared
+workspace, the nursery, the flag bridge, the two desks, the crash policy, the two watchers — then
+pump the bus forever. It returns only through the fatal guard, so the returned string is the stop
+report."
+agent serve(public_channel: string, control_channel: string) -> string {
+  // THE FATAL GUARD, outermost and deliberately OUTSIDE the restart loop below: a revoked token or
+  // a missing secret answers the same however often it is retried, so every anticipated throw ends
+  // the run LOUDLY. Absorbing — or endlessly retrying — an auth-shaped failure would leave a bot
+  // that looks alive and answers nothing.
+  use handler {
+    request prelude.throw(error: app_error) -> never { break f"stopped: ${json.stringify(value = error)}" }
+  }
+  // THE RESTART LOOP, because a gateway client lives in the sidecar PROCESS and not in the durable
+  // log: a RUNTIME restart replays a handle that process no longer knows, so the interrupted
+  // `watch_messages` comes back as a panic and every later post through that handle panics too.
+  // Both providers sit INSIDE this loop, so each attempt logs in again with a live handle — the
+  // ffi-sidecars guide's shape. The converter catches a panic on the SESSION's own path; a panic
+  // inside a FIBER never reaches it (the runtime turns that one into `region.crashed` rather than
+  // unwinding the watch), so the crash policy signals its own rebuild.
+  use replay.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 60000.0)
+  use handler {
+    request panic(msg: string) -> never { replay.interrupted(failure = msg) }
+  }
+  use anthropic.provider(source = credentials.env(key = "ANTHROPIC_API_KEY"), system = face_persona())
+  use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
+  // THE ONE WORKSPACE — place and serial domain in one install, and the sharing is the
+  // geometry: neither desk opens a workspace of its own, so the memory facility resolves to
+  // the same `concierge/memory/…` from the face's read tools and the control desk's writes
+  // alike, and the facility's write sections serialize at this install's FIFO. (Per-desk
+  // workspaces would need `store.share` to cross; with no desk-private store traffic, the one
+  // workspace IS the shared place.)
+  use store.workspace(path = "concierge")
+
+  agent operator_note(text: string) -> null {
+    // The control channel is the reporting channel of last resort, so a dropped note here has
+    // nowhere better to go. That is honest to leave: the durable notes are the source of
+    // truth and `notes` re-reads them, so a lost confirmation costs a re-ask, never a fact.
+    match (discord.try_send(channel = control_channel, text = discord.fit_message(text = text, marker = " …(cut)"))) {
+      case discord.delivered(_) -> null
+      case discord.dropped(reason => _) -> null
+    }
+  }
+
+  agent face_reply(reply: string) -> null {
+    match (discord.try_send(channel = public_channel, text = discord.fit_message(text = reply, marker = " …(cut)"))) {
+      case discord.delivered(_) -> null
+      // The channel never saw this reply and nothing will retry it — report it where someone
+      // can act instead of letting the silence pass as delivery.
+      case discord.dropped(reason => reason) -> operator_note(text = f"(a public reply was dropped: ${reason})")
+    }
+  }
+
+  // The face's whole capability, as data — the membrane IS this list: three READS of the
+  // shared notes, and the flag. No write reaches the face. The memory tools go over raw
+  // because their docs cross-reference each other by name (recall points at list_memories);
+  // the persona reframes whose notes they are.
+  let face_tools = [memory.recall, memory.search, memory.list_memories, flag_unknown]
+
+  let nursery: region.nursery[concierge_scope, concierge_ceiling] = use region.provide[concierge_scope, concierge_ceiling]
+
+  // THE FLAG BRIDGE — below the nursery because it needs the handle, above the face desk
+  // because the face's tool performs `flag_question` from that desk's install site. Mail is a
+  // fiber whose whole body is one perform: it queues in the region's durable mailbox BEHIND
+  // the turn that sent it, so a mid-turn flag can never re-enter a busy desk. The guide's hop
+  // counter has nothing to count here — the mail runs one way and the control desk never mails
+  // onward, so there is no relay loop to damp.
+  use handler {
+    request flag_question(question: string) {
+      let _mail = region.post(
+        nursery = nursery,
+        task = agent () -> null with question_flagged { question_flagged(question = question) },
+        name = "flag->control",
+      )
+      next "(flagged for the owner. They may publish a note; until then, tell the asker you do not know.)"
+    }
+  }
+
+  // THE FACE DESK — one sequential handler, one `ai.desk` var: the conversation is run state,
+  // rebuilt by replay after a restart. `model_down` makes outage notices TRANSITION-only, so a
+  // dead provider costs the channels one line each, not one per message.
+  use handler (var face: ai.desk = ai.new_desk(), var model_down: boolean = false) {
+    request face_message(content: string, files: array[file], author: string) {
+      let advanced = ai.advance_desk(
+        state = face,
+        arrival = ai.arrival(source = "public-channel", content = content, hop = 0, files = files, author = author),
+        tools = face_tools,
+        persona = published_notes,
+        deliver_to = face_reply,
+      )
+      match (advanced.outcome) {
+        case ai.answered(reply => _) -> {
+          // A non-blank reply already left through `face_reply`; a blank one is silence by
+          // protocol. Coming back from an outage is worth one line to the owner — the held
+          // messages just rejoined this very turn.
+          if (model_down) { operator_note(text = "(the face's model is answering again.)") } else { null }
+          next null with { face = advanced.state, model_down = false }
+        }
+        case ai.filed(held => _, dropped => _) -> {
+          // Reachable only under `ai.with_breaker`, which this program does not install. The
+          // outcome sum carries the arm, so the fold says so instead of inventing behaviour.
+          next null with { face = advanced.state }
+        }
+        case ai.step_failed(error => error) -> {
+          // The arrival is already FILED in the desk's backlog and rejoins the next turn, so the
+          // public line promises exactly that and nothing more — `ai.outage_line`'s wording is not
+          // ours to borrow, since it promises that calling has STOPPED, which is only true under a
+          // breaker this program does not install. No retry here either: the provider spent its own
+          // retry budget before this outcome existed.
+          if (model_down) {
+            null
+          } else {
+            face_reply(reply = "(I cannot think right now — your message is kept, and I will answer as soon as I can.)")
+            match (ai.classify_outage(error = error)) {
+              case ai.needs_operator(remedy => remedy) -> operator_note(text = f"(the face's model call failed and will not heal on its own: ${remedy})")
+              case ai.waits_out(_) -> operator_note(text = f"(the face's model call failed — likely transient: ${json.stringify(value = error)}. Held messages rejoin the next successful turn.)")
+            }
+          }
+          next null with { face = advanced.state, model_down = true }
+        }
+      }
+    }
+  }
+
+  // THE CONTROL DESK — sequential and var-free: the notes themselves are the state, durable in
+  // the store, so a restart forgets nothing and only this desk's command path ever writes.
+  // Serving BOTH requests in one handler keeps owner commands and face flags on one FIFO — one
+  // voice in the control channel.
+  use handler {
+    request control_message(text: string) {
+      match (parse_command(text = text)) {
+        case publish_note(key => key, text => body) -> {
+          // A note key becomes a store path inside the memory facility, so it is held to the
+          // store's own definition of one. An odd key (a stray space, a `..`) would store and read
+          // back, but the owner and the face must both spell it afterwards — so it is refused
+          // while there is still somebody to correct.
+          if (store.is_safe_path(path = key)) {
+            let replaced = record.has(target = memory.index(), key = key)
+            // The one text serves as both halves of a memory note — the index line the face
+            // sees every turn, and the body `recall` reads. One `remember` writes both, so
+            // they cannot drift; the confirmation below is ours, not the tool's model-facing
+            // one.
+            let _confirmation = memory.remember(key = key, summary = body, body = body)
+            let verb = if (replaced) { "replaced" } else { "published" }
+            operator_note(text = f"(${verb} \"${key}\" — the face answers from it on its next turn.)")
+          } else {
+            operator_note(text = f"(refused: \"${key}\" cannot be a note key — use lowercase letters, digits, - and _, with / to group.)")
+          }
+          next null
+        }
+        case retract_note(key => key) -> {
+          // Read-then-act without a race: this desk is the only writer, and it is serial. The
+          // check exists because `memory.forget` reports a missing key as success (a no-op),
+          // and an owner who retracts a typo must not believe they removed something.
+          if (record.has(target = memory.index(), key = key)) {
+            let _confirmation = memory.forget(key = key)
+            operator_note(text = f"(retracted \"${key}\" — the face no longer knows it.)")
+          } else {
+            operator_note(text = f"(nothing is published under \"${key}\" — send `notes` to see the keys.)")
+          }
+          next null
+        }
+        case list_notes(_) -> {
+          operator_note(text = memory.list_memories())
+          next null
+        }
+        case show_help(note => note) -> {
+          let lead = if (string.is_blank(value = note)) { "" } else { f"${note}\n" }
+          operator_note(text = f"${lead}${help_text()}")
+          next null
+        }
+      }
+    }
+    request question_flagged(question: string) {
+      operator_note(text = f"(the face was asked something the notes do not cover: \"${question}\" — `publish <key>: <text>` to teach it.)")
+      next null
+    }
+  }
+
+  // WHAT A FIBER'S DEATH MEANS. `crashed` is a defect (a panic), and for a WATCHER the likeliest
+  // cause is the runtime restarting under it: the gateway handle the run replayed is dead, so
+  // re-forking would only re-arm a connection that no longer exists. A dead watcher therefore
+  // REBUILDS the session through the restart loop above — one fresh login, both channels listening
+  // again — and the note goes out first, so a rebuild LOOP is visible in the control channel (on
+  // the restart path that note cannot land, and that attempt is silent by necessity). `failed` is
+  // an escaped throw, and the only throws a fiber here can raise are credential-shaped
+  // (`author_tag`'s resolution): non-self-healing, so no rebuild — that source stays down.
+  use handler {
+    request region.crashed(id: string, name: string, message: string) {
+      operator_note(text = f"(fiber ${name} crashed: ${message})")
+      match (crash_verdict_of(name = name)) {
+        case rebuild_session(_) -> { replay.interrupted(failure = f"the ${name} fiber crashed: ${message}") }
+        // A dead flag mail is one lost flag; the face already told the asker it does not know, so
+        // nothing else depends on it and the session keeps serving.
+        case lost_one_shot(_) -> { next null }
+      }
+    }
+    request region.failed(id: string, name: string, error: unknown) {
+      operator_note(text = f"(fiber ${name} stopped on an error and stays down: ${json.stringify(value = error)})")
+      next null
+    }
+  }
+
+  let _face_watcher = region.fork(nursery = nursery, task = face_source, argument = public_channel, name = face_watcher_name())
+  let _control_watcher = region.fork(nursery = nursery, task = control_source, argument = control_channel, name = control_watcher_name())
+  region.watch(nursery = nursery)
+}
+
+// ── the entry ─────────────────────────────────────────────────────────────────────────────────────
+
+@"One env entry read as configuration: `null` when unset OR blank, so an empty value cannot
+half-configure a channel."
+agent configured(key: string) -> string | null {
+  match (env.get(key = key)) {
+    case null -> null
+    case value -> {
+      if (string.is_blank(value = value)) {
+        null
+      } else {
+        string.trim(value = value)
+      }
+    }
+  }
+}
+
+@"Entry: validate the two channel ids, then serve forever. Boot refuses a missing channel, and
+refuses the two channels being ONE channel — that would collapse the membrane, since every
+community member could then publish."
+agent main() -> string {
+  match (configured(key = "PUBLIC_CHANNEL")) {
+    case null -> "refused to start: PUBLIC_CHANNEL is not set — `katari env set PUBLIC_CHANNEL <channel id>`."
+    case public_channel -> {
+      match (configured(key = "CONTROL_CHANNEL")) {
+        case null -> "refused to start: CONTROL_CHANNEL is not set — `katari env set CONTROL_CHANNEL <channel id>`."
+        case control_channel -> {
+          if (public_channel == control_channel) {
+            "refused to start: PUBLIC_CHANNEL and CONTROL_CHANNEL are the same channel — the control channel is the membrane, and one shared channel would let every member publish."
+          } else {
+            serve(public_channel = public_channel, control_channel = control_channel)
+          }
+        }
+      }
+    }
+  }
+}

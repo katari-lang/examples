@@ -1,0 +1,6 @@
+# Local runtime credentials / keys.
+.env
+# CLI build artifacts and caches.
+.katari/
+# Sidecar (FFI) dependencies.
+node_modules/

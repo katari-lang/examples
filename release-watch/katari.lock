@@ -1,0 +1,22 @@
+[lock]
+version = 1
+snapshot = "snapshot-2026-07-29-56e87e45"
+katari_compiler = "0.1.0-rc12"
+
+[packages.discord]
+source = "git"
+url = "https://github.com/katari-lang/katari-package-discord"
+rev = "4e997d238e6975263711a3202c29f90376e1ba96"
+sha256 = "244c8e215d2229eb1234d099f0a9cfb40c2f7f8951defbe63d780f8bf017e867"
+
+[packages.fleet]
+source = "git"
+url = "https://github.com/katari-lang/katari-package-fleet"
+rev = "bd6a647c18f53ca68857cd0b0049f8fb4efa592b"
+sha256 = "f9e6780c7b8a174be32a39d71204f29a06f4760b9cf19ed5d3e217e8cc859cc0"
+
+[packages.web]
+source = "git"
+url = "https://github.com/katari-lang/katari-package-web"
+rev = "45ed57e314c4cd0907b7c0bc0fb88160a38ef775"
+sha256 = "627371909ce9da94f4109035de51c33b8ac37e2ead5559e76d1eb412f6741690"

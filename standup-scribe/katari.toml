@@ -1,0 +1,11 @@
+[package]
+name = "standup_scribe"
+description = "A Slack standup scribe: opens a weekday window, collects replies, and posts a model-drafted digest only after the facilitator approves it."
+
+[runtime]
+url = "http://localhost:3000"
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "snapshot-2026-07-29-56e87e45"
+packages = ["slack", "ai"]

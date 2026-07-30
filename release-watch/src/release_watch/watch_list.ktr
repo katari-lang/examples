@@ -1,0 +1,188 @@
+// The durable side of the monitor: WHAT IS DESIRED (the `fleet` registry — the operator's standing
+// orders) and WHAT HAS BEEN SEEN (per-watch cursor + last outcome). Both live in the app's SHARED
+// PLACE, because two serialization domains reach them — the control desk and the poll fiber — and
+// shared data is reached by sending a task to the `store.share` install site, never by a path out
+// of one's own workspace. The subtrees have separate writers: only the desk writes `watches/` (a
+// decision — boot's validate-or-drop sweep is the one other hand, and it only deletes what no longer
+// reads), only the poll loop writes `repositories/` (an observation; the desk deletes a row on
+// unwatch) — so a failing check can never edit a standing order.
+
+import fleet
+import release_watch.commands
+
+@"The watch registry's root in the shared place — the one argument every `fleet` call takes,
+spelled once. `fleet` owns the geometry below it (`watches/specs/<name>`, `watches/next_id`)."
+agent watch_list_path() -> string {
+  "watches"
+}
+
+@"The working-state subtree: one cell per watch at `repositories/<name>`, keyed by the fleet-minted
+name (a legal store segment by construction). A sibling of the registry, so state can never touch a
+spec."
+agent repositories_path() -> string {
+  "repositories"
+}
+
+// ── what one completed check amounted to ──────────────────────────────────────────────────────────
+
+@"The first successful check: the cursor was primed at the current latest @tag@ WITHOUT announcing
+— a watch starts at now, never with the backlog."
+data baseline_set(@"The primed tag; empty when the repository has no releases yet." tag: string)
+
+@"The check found nothing newer than the cursor (or still no releases at all)."
+data no_new_release()
+
+@"The check announced @tag@ and advanced the cursor to it."
+data release_announced(@"The announced release tag." tag: string)
+
+@"A new release was found but the Discord post dropped, so the cursor was NOT advanced: the next
+tick retries. A value precisely so `list` shows the drop instead of pretending it posted."
+data announcement_dropped(@"The tag that should have been announced." tag: string, @"Why the post dropped, in Discord's words." reason: string)
+
+@"The check itself failed — the probe's folded reason, carried so `list` shows a typo'd name or a
+rate limit without anyone reading logs."
+data check_failed(@"Why the check failed, in one line." reason: string)
+
+// The last completed check of one repository, as a dispatchable fact. (Type synonyms take no docs.)
+type check_outcome = baseline_set | no_new_release | release_announced | announcement_dropped | check_failed
+
+// The cursor is a SUM, not a string with sentinel readings: "never successfully checked" and
+// "checked, and there was nothing" must not blur — or a watch whose first check failed would later
+// announce the pre-watch backlog, and a repository watched before its first release would have
+// that first release silently swallowed as a late baseline.
+
+@"No successful check has happened yet, so nothing can be judged new."
+data no_baseline()
+
+@"The watch last stood at zero published releases, so ANY release that appears is new."
+data nothing_released()
+
+@"Releases up to @tag@ are old news; a different latest tag is new."
+data announced_up_to(@"The baseline or last announced tag." tag: string)
+
+// Where one watch's announce cursor stands. (Type synonyms take no docs.)
+type cursor = no_baseline | nothing_released | announced_up_to
+
+@"One watch's durable working state: the cursor and the last outcome in ONE cell, so a tick commits
+both with one write and a reader can never see them disagree."
+data watch_state(
+  @"Where the announce cursor stands." cursor: cursor,
+  @"What the most recent completed check amounted to." outcome: check_outcome,
+)
+
+// ── the desired set, bound to `fleet` ─────────────────────────────────────────────────────────────
+
+@"Record @repository@ as desired and mint its durable name (`repository-<n>`). The desk is the only
+caller, and its FIFO makes the desk's check-then-register duplicate guard sound."
+agent save_watch(repository: commands.repository_spec) -> string with store.shared | prelude.throw[json.validation_error] {
+  fleet.register(root = watch_list_path(), kind = "repository", spec = repository)
+}
+
+@"Drop @name@ from the desired set and delete its working state — the one door out, always a
+DECISION (the operator said stop); nothing on any failure path calls this. A tick mid-check of this
+very repository may re-write the state cell just after; that orphan joins no listing (names are
+never re-minted) and is cheaper than a lock across two domains."
+agent remove_watch(name: string) -> null with store.shared {
+  fleet.forget(root = watch_list_path(), name = name)
+  agent clear() -> null {
+    use store.scope(path = repositories_path())
+    store.delete(key = name)
+  }
+  let _cleared = store.shared(task = clear)
+  null
+}
+
+@"The desired set, raw — read fresh by every tick and by `list`, so there is no in-memory copy to
+drift: the store is the ONLY record of what is watched."
+agent read_watches() -> array[fleet.row[unknown]] with store.shared | prelude.throw[json.validation_error] {
+  fleet.desired(root = watch_list_path())
+}
+
+@"Validate one stored spec, TOTALLY — the one callback the sweep and every row reader share, so
+they can never disagree on what parses."
+agent validate_watch(value: unknown) -> commands.repository_spec | null {
+  json.try_validate[commands.repository_spec](value = value)
+}
+
+@"Boot's validate-or-drop over the desired set: keep what still reads as a `repository_spec`,
+delete what does not, answer with both halves — the sentence about the drops belongs to the app."
+agent sweep_watches() -> fleet.sweep_result[commands.repository_spec] with store.shared | prelude.throw[json.validation_error] {
+  fleet.sweep[commands.repository_spec](root = watch_list_path(), validate = validate_watch)
+}
+
+@"The desired row watching @repository@, or `null` — the lookup behind `unwatch` and the duplicate
+guard behind `watch`. Compares the validated spec, so an unreadable row can never match."
+agent find_watch(repository: commands.repository_spec) -> string | null with store.shared | prelude.throw[json.validation_error] {
+  let matches = array.filter(target = read_watches(), keep = agent (value: fleet.row[unknown]) -> boolean {
+    match (validate_watch(value = value.spec)) {
+      case null -> false
+      case spec -> spec.owner == repository.owner && spec.name == repository.name
+    }
+  })
+  match (array.get(target = matches, index = 0)) {
+    case null -> null
+    case row -> row.name
+  }
+}
+
+// ── the working state ─────────────────────────────────────────────────────────────────────────────
+
+@"One watch's working state, or `null` before its first check. A cell that no longer reads (a
+hand-edited value) also answers `null` — the next check re-primes the baseline, a better ending for
+a corrupt observation than crashing a listing over it."
+agent read_state(name: string) -> watch_state | null with store.shared | prelude.throw[json.validation_error] {
+  agent read() -> watch_state | null {
+    use store.scope(path = repositories_path())
+    match (store.get(key = name)) {
+      case store.found(value => value) -> json.try_validate[watch_state](value = value)
+      case store.absent(key => _) -> null
+    }
+  }
+  store.shared_as[watch_state | null](task = read)
+}
+
+@"Commit one watch's working state — one whole-cell write, last write wins; the poll loop is the
+only writer and writes at most once per repository per tick."
+agent write_state(name: string, state: watch_state) -> null with store.shared {
+  agent write() -> null {
+    use store.scope(path = repositories_path())
+    store.set(key = name, value = state)
+  }
+  let _written = store.shared(task = write)
+  null
+}
+
+// ── rendering for `list` ──────────────────────────────────────────────────────────────────────────
+
+@"One desired row as a `list` line: repository, cursor, last outcome — the operator's whole view of
+a watch's health, so a typo'd name (its 404) is readable HERE, not in logs. An unreadable row is
+still SHOWN (a standing order must never silently vanish from a listing); boot's sweep deletes it."
+agent render_row(row: fleet.row[unknown]) -> string with store.shared | prelude.throw[json.validation_error] {
+  match (validate_watch(value = row.spec)) {
+    case null -> f"`${row.name}`: (stored spec is unreadable; it is dropped at the next restart)"
+    case repository -> {
+      let subject = commands.render_repository(repository = repository)
+      match (read_state(name = row.name)) {
+        case null -> f"`${row.name}` ${subject} — not checked yet"
+        case state -> f"`${row.name}` ${subject} — ${render_state(state = state)}"
+      }
+    }
+  }
+}
+
+@"One `watch_state` as the human phrase `list` appends after the repository."
+agent render_state(state: watch_state) -> string {
+  let standing = match (state.cursor) {
+    case no_baseline(_) -> "no baseline yet"
+    case nothing_released(_) -> "no releases published yet"
+    case announced_up_to(tag => tag) -> f"cursor at ${tag}"
+  }
+  let outcome = match (state.outcome) {
+    case baseline_set(tag => tag) -> if (string.is_blank(value = tag)) { "baseline set; the first release published from here is announced" } else { f"baseline set at ${tag}; announcing releases published after it" }
+    case no_new_release(_) -> "ok, nothing new"
+    case release_announced(tag => tag) -> f"announced ${tag}"
+    case announcement_dropped(tag => tag, reason => reason) -> f"found ${tag} but the announcement was dropped (${reason}); retrying next tick"
+    case check_failed(reason => reason) -> f"FAILED: ${reason}"
+  }
+  f"${standing}; last check: ${outcome}"
+}

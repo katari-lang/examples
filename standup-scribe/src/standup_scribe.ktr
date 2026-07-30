@@ -1,0 +1,581 @@
+// standup-scribe: a Slack standup scribe, as one small resident.
+//
+// Every weekday at a configured hour a schedule fiber opens the standup: it posts the prompt to the
+// standup channel and the desk collects the replies threaded under it. When the window closes, one
+// model step drafts the digest and the facilitator reviews it — post it, rewrite it in place, or
+// discard it — before anything reaches the channel. The two Slack planes carry the two halves:
+// messages in and out for collection, one blocking `ask` for the review.
+
+import ai
+import ai.types
+import ai.anthropic
+import slack
+
+// ─── configuration ────────────────────────────────────────────────────────────────────────────────
+
+@"Everything the resident reads from the project env at boot, carried as one value so the schedule
+fiber and the crash policy see exactly the configuration the boot validated."
+data settings(
+  @"The channel the standup opens in and the approved digest posts to." standup_channel: string,
+  @"Where the review question and every operator-facing note go; may equal the standup channel." facilitator_channel: string,
+  @"The weekday hour (0-23) the window opens, read in @timezone@." standup_hour: integer,
+  @"The IANA zone the schedule and the digest's date are read in." timezone: string,
+  @"How long the window stays open." window_minutes: integer,
+)
+
+@"A required env entry is not set. Thrown at boot, so a half-configured scribe stops before it ever
+opens a window."
+data missing_config(name: string)
+
+@"STANDUP_HOUR is outside 0-23. Thrown at boot: `time.cron` would panic inside the schedule fiber
+instead, and the crash policy would rebuild the session on every attempt."
+data bad_hour(hour: integer)
+
+@"WINDOW_MINUTES is not at least one minute. Thrown at boot for the quiet failure it otherwise is: a
+window that closes the instant it opens posts the prompt and reports \"no entries\" every weekday, so
+a mistyped value would read as a team that stopped answering."
+data bad_window(minutes: integer)
+
+@"STANDUP_TIMEZONE names a zone the runtime's zone database does not know. Thrown at boot: a wrong
+zone must stop the scribe rather than quietly date every window at UTC."
+data bad_timezone(zone: string)
+
+@"A fiber died on an error no guard folds — an auth failure, or configuration drift. Re-raised by the
+region's `failed` policy to stop the run loudly instead of leaving a resident that looks alive and
+does nothing."
+data fiber_failure(name: string, detail: string)
+
+// Everything the composition root anticipates stopping on. (Type synonyms take no docs.)
+type app_error =
+  slack.slack_error | env.missing_secret | oauth.server_error
+  | missing_config | bad_hour | bad_window | bad_timezone | fiber_failure
+
+// ─── the bus ──────────────────────────────────────────────────────────────────────────────────────
+
+@"The scribe desk's inbox for channel traffic: one incoming Slack message, reported by the watcher."
+request channel_message(author: string, text: string, thread: string | null) -> null
+
+@"Open the day's window at the desk: from now on, collect the replies threaded under @prompt_ts@."
+request window_started(date: string, prompt_ts: string) -> null
+
+@"Close the window at the desk and take the collected entries; the desk goes idle."
+request window_finished() -> array[entry]
+
+@"The region's scope marker: one nullary phantom per nursery."
+effect scribe_scope
+
+// What the schedule fiber may raise: the desk's window controls, the Slack connection it posts and
+// asks through, the model seam, and the store rows of its once-per-date marker. Throws are absent by
+// the region contract — an uncaught fiber throw surfaces as the typed `region.failed` event, never
+// as a throw. (Type synonyms take no docs.)
+type schedule_effects =
+  window_started | window_finished | slack.connection | ai.infer_step | store.get | store.set | io
+
+// The nursery's ceiling is the union of every fiber kind; each fork stays bounded by its own row.
+// (Type synonyms take no docs.)
+type fiber_ceiling = channel_message | schedule_effects
+
+// ─── the desk's state ─────────────────────────────────────────────────────────────────────────────
+
+@"One collected standup reply: a pseudonymous author tag and what they wrote."
+data entry(author: string, text: string)
+
+@"No window is open: channel chatter is none of the scribe's business."
+data idle()
+
+@"A window is open: replies threaded under @prompt_ts@ are collected until the schedule closes it."
+data collecting(date: string, prompt_ts: string, entries: array[entry])
+
+// The scribe desk's whole state. (Type synonyms take no docs.)
+type window_state = idle | collecting
+
+// ─── the day's window, as the store remembers it ──────────────────────────────────────────────────
+
+@"One window as the STORE remembers it: the prompt's `ts` — the thread every entry hangs under — and
+the instant it closes. Keeping BOTH facts outside the fiber is what lets a window outlive the fiber
+that opened it, so a session rebuilt mid-window picks the day back up instead of losing it."
+data recorded_window(prompt_ts: string, close_at: number)
+
+@"Nothing is recorded for the date, so no window is open and there is none to resume."
+data no_window()
+
+@"A row is there but cannot be read as a window — written by an older version of this program, or
+hand-edited. A value rather than a panic: an operator who upgrades mid-day loses one window's recovery
+and hears about it, instead of a fiber dying on a cell it did not write."
+data unreadable_marker()
+
+// What one date's marker says. (Type synonyms take no docs.)
+type marker = recorded_window | no_window | unreadable_marker
+
+// The marker's stored shape — an object, so the row this program writes is the row a person reads in
+// the console. (Type synonyms take no docs.)
+type marker_row = { prompt_ts: string, close_at: number }
+
+@"Nothing is recorded yet, so this run posts the prompt and writes the marker itself; @close_at@ is
+when the window it opens will close."
+data open_fresh(close_at: number)
+
+// Where one run of the standup gets its window: it opens one, or picks up the one the store holds.
+// (Type synonyms take no docs.)
+type opening = open_fresh | recorded_window
+
+@"The store key one date's window is remembered under, spelled once: the occurrence that writes it and
+the recovery that reads it must name the window identically or the recovery finds nothing."
+agent marker_key(date: string) -> string {
+  f"standup/prompts/${date}"
+}
+
+@"Read one date's marker TOTALLY, into the three things it can say. Nothing here throws: a shape this
+program no longer writes is a fact about the store, not a failure of the run."
+agent read_marker(date: string) -> marker with store.get {
+  match (store.get(key = marker_key(date = date))) {
+    case store.absent(key => _) -> no_window()
+    case store.found(value => value) -> {
+      match (json.try_validate[marker_row](value = value)) {
+        case null -> unreadable_marker()
+        case row -> recorded_window(prompt_ts = row.prompt_ts, close_at = row.close_at)
+      }
+    }
+  }
+}
+
+// ─── failure discipline ───────────────────────────────────────────────────────────────────────────
+
+// What one occurrence folds into a facilitator note instead of dying on: a model step that gave up
+// (transport, a rate limit past the provider's own retries, a malformed reply) and a Slack API
+// refusal. Auth failures are deliberately NOT here — a revoked token answers the same tomorrow, so
+// absorbing one would degrade the scribe into a silent no-op; it must stop the run loudly instead.
+// (Type synonyms take no docs.)
+type occurrence_trouble =
+  ai.provider_error | http.api_error | http.fetch_error | json.parse_error | slack.api_error
+
+// The throws one occurrence deliberately lets fly: the fiber dies, `region.failed` re-raises, the
+// run stops. (Type synonyms take no docs.)
+type occurrence_fatal = bad_timezone | slack.auth_error | http.auth_error
+
+@"Put one line in front of the facilitator, absorbing a transient drop. `try_send` already folds a
+Slack refusal into `dropped`, and a dropped facilitator note has nowhere left to be reported — this
+channel IS the reporting channel — so the outcome is read and deliberately not re-raised (the run's
+event log still records the attempt). A dead token still stops the scribe: `try_send` re-raises
+`auth_error`."
+agent tell_facilitator(channel: string, text: string) -> null with slack.connection | io | prelude.throw[slack.auth_error] {
+  match (slack.try_send(channel = channel, text = text)) {
+    case slack.delivered(_) -> null
+    case slack.dropped(reason => _) -> null
+  }
+}
+
+// ─── the sources ──────────────────────────────────────────────────────────────────────────────────
+
+@"The channel watcher, run as a fiber: serve the standup channel forever, reporting every incoming
+message to the scribe desk. Collection policy lives at the desk, not here — the watcher reports
+everything and stays ignorant of windows."
+agent channel_watcher(input: string) -> never with channel_message | slack.connection | io {
+  agent deliver(value: slack.message) -> null with channel_message {
+    channel_message(author = value.author, text = value.text, thread = value.thread)
+  }
+  slack.watch_messages(channel = input, deliver_to = deliver)
+}
+
+@"The schedule fiber: pick up any window a rebuilt session left open, then fire every weekday at the
+configured hour — open the window, wait it out, close it, and see the digest through review. One fiber
+runs all of it deliberately: `time.watch` serializes deliveries so an occurrence can never overlap
+itself, and the desk stays free to collect while this fiber sleeps or waits on the facilitator."
+agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal] {
+  @"The calendar date an instant falls on, read in the configured zone — what the marker and the digest
+  are both named by. Boot validated the zone, so the null arm is configuration drift, not weather."
+  agent date_of(instant: number) -> string with prelude.throw[bad_timezone] {
+    match (time.zone_offset(epoch_milliseconds = instant, zone = input.timezone)) {
+      case null -> prelude.throw(error = bad_timezone(zone = input.timezone))
+      case minutes -> time.date_label(epoch_milliseconds = instant, offset_minutes = minutes)
+    }
+  }
+  @"Run one standup from @opening@ to its end: get the window (posting the prompt if this is the one
+  that opens it), collect until it closes, then report the silence or draft the digest and see it
+  through review. BOTH ways in come here — a scheduled occurrence and the recovery below — so a window
+  that outlived its fiber ends exactly as the original would have."
+  agent run_standup(date: string, opening: opening) -> null with schedule_effects | prelude.throw[occurrence_fatal] {
+    // THE GUARD, one policy over the whole standup: a failure that can heal becomes one facilitator
+    // line and this run ends quietly; the fatal residual re-raises AS BOUND (the same move
+    // `slack.try_send`'s rest arm makes), so the fiber's death reaches the region's `failed` policy
+    // and stops the run.
+    use handler {
+      request prelude.throw(error: occurrence_trouble | occurrence_fatal) -> never {
+        let line = match (error) {
+          case ai.provider_error(source => source, message => message, transient => _, detail => _) -> f"the model provider failed (${source}: ${message})"
+          case http.api_error(status => status, context => context, message => message) -> f"an http call was refused (${context}: ${string.to_string(value = status)} — ${message})"
+          case http.fetch_error(message => message) -> f"the network dropped (${message})"
+          case json.parse_error(message => message) -> f"a reply failed to parse (${message})"
+          case slack.api_error(message => message) -> f"Slack refused a call (${message})"
+          case rest -> prelude.throw(error = rest)
+        }
+        tell_facilitator(
+          channel = input.facilitator_channel,
+          text = f"(standup ${date}: gave up — ${line}. Nothing was posted; the schedule stays armed for the next weekday.)",
+        )
+        break null
+      }
+    }
+    let window = match (opening) {
+      // The window is recorded BEFORE anything is collected, and it records the close instant as well
+      // as the thread: a fiber's death can take the collection with it, but never the window itself.
+      // A plain text post always comes back with its `ts` (the empty string `send_message` documents
+      // guards the file-upload path), so the marker is never written blank.
+      case open_fresh(close_at => close_at) -> {
+        let posted = slack.send_message(
+          channel = input.standup_channel,
+          text = f"Standup time! Reply in this thread within ${string.to_string(value = input.window_minutes)} minutes: yesterday / today / blockers.",
+        )
+        store.set(key = marker_key(date = date), value = { prompt_ts = posted, close_at = close_at })
+        recorded_window(prompt_ts = posted, close_at = close_at)
+      }
+      case rest -> rest
+    }
+    window_started(date = date, prompt_ts = window.prompt_ts)
+    // Close at the instant the STORE holds, not at one derived here: a resumed window then ends when
+    // the original would have, and a restart mid-window sleeps the remainder rather than a fresh hour.
+    time.sleep_until(time = window.close_at)
+    let entries = window_finished()
+    if (array.length(target = entries) == 0) {
+      // Nobody replied: no model call, no review — one line so the facilitator knows the silence
+      // was the team's, not the scribe's.
+      tell_facilitator(channel = input.facilitator_channel, text = f"(standup ${date}: no entries in the window — nothing to digest.)")
+    } else {
+      // Fit ONCE, here: 3000 is both the message cap an ask's prompt fails at and the form field's
+      // content bound, so this one fitted string is what the preview quotes, what prefills the Edit
+      // box, and what posts.
+      let draft = slack.fit_message(
+        text = draft_digest(date = date, entries = entries),
+        marker = "\n… (cut to fit Slack's 3000-character cap)",
+      )
+      review_and_post(configuration = input, date = date, draft = draft)
+    }
+  }
+  @"One scheduled occurrence. @time@ is the occurrence's SCHEDULED epoch millisecond, not the delivery
+  instant — stable across an at-least-once redelivery, which is what makes both the date below and the
+  close instant derived from it the same on every delivery of the same occurrence."
+  agent occurrence(time: number) -> null with schedule_effects | prelude.throw[occurrence_fatal] {
+    let date = date_of(instant = time)
+    let close_at = time + input.window_minutes * 60000
+    match (read_marker(date = date)) {
+      // A row exists but cannot be read, so its prompt IS already in the channel and only its lifetime
+      // is unknown. Skipping is the safe half of that: a second prompt for a standup that opened is
+      // worse than one skipped day, and the day is not skipped silently.
+      case unreadable_marker(_) -> {
+        tell_facilitator(channel = input.facilitator_channel, text = f"(standup ${date}: the marker ${marker_key(date = date)} is not in a shape this version reads, so the prompt was NOT re-posted and today is skipped. Delete that row to let the scribe open a fresh window.)")
+      }
+      // Nothing recorded, and the window would already be over: this is the single catch-up `time.watch`
+      // fires for an outage, so posting a prompt nobody can still reply to would only litter the channel.
+      case no_window(_) -> {
+        if (time.now() >= close_at) {
+          tell_facilitator(channel = input.facilitator_channel, text = f"(standup ${date}: missed — the scribe was down for the whole window, so no prompt was posted.)")
+        } else {
+          run_standup(date = date, opening = open_fresh(close_at = close_at))
+        }
+      }
+      // Recorded already: a redelivery of an occurrence that ran, so the SAME window re-opens and no
+      // second prompt goes out. One that has already closed is over — re-opening it would collect
+      // nothing and report a silence that was never the team's.
+      case rest -> {
+        if (time.now() < rest.close_at) {
+          run_standup(date = date, opening = rest)
+        } else {
+          null
+        }
+      }
+    }
+  }
+  // RECOVERY, BEFORE THE WATCH — this is what a rebuilt session costs and how the cost is paid. `main`
+  // rebuilds the session on a panic (a restart kills the sidecar's connection), which forks this fiber
+  // fresh, and a fresh `time.watch` arms on the NEXT occurrence: today's open window would be left with
+  // nobody to close it. The store holds the window's identity AND its lifetime, so the new fiber picks
+  // it up and ends it on time. The watch arms after that, exactly as serialized deliveries would.
+  let now = time.now()
+  let today = date_of(instant = now)
+  match (read_marker(date = today)) {
+    case no_window(_) -> null
+    case unreadable_marker(_) -> {
+      tell_facilitator(channel = input.facilitator_channel, text = f"(scribe: today's marker (${marker_key(date = today)}) is not in a shape this version reads, so no window was resumed.)")
+    }
+    case rest -> {
+      if (now < rest.close_at) {
+        run_standup(date = today, opening = rest)
+      } else {
+        // The window closed before this fiber existed: whether its digest posted is not recorded, and
+        // this is also the ordinary state of every hour after a standup, so there is nothing to say.
+        null
+      }
+    }
+  }
+  time.watch(
+    schedule = time.cron(
+      expression = f"0 ${string.to_string(value = input.standup_hour)} * * 1-5",
+      timezone = input.timezone,
+    ),
+    deliver_to = occurrence,
+  )
+}
+
+// ─── the digest ───────────────────────────────────────────────────────────────────────────────────
+
+@"Draft the digest in ONE model step over the collected entries — a one-shot `ai.reply`, not a chat
+loop: the scribe has nothing to converse about, and a single step keeps the failure surface exactly
+one guard wide."
+agent draft_digest(date: string, entries: array[entry]) -> string with ai.infer_step | prelude.throw[ai.step_error] {
+  let lines = for (let item in entries) {
+    next f"${item.author}: ${item.text}"
+  }
+  let briefing = string.join(parts = [
+    f"Draft a compact standup digest for ${date} from the raw replies below.",
+    "Group by author tag, keeping each to a line or two in a yesterday / today / blockers shape where the reply supports it.",
+    "Close with one shared-blockers line only if any blockers appeared. Output plain Slack mrkdwn, no preamble.",
+    "Replies:",
+    string.join(parts = lines, separator = "\n"),
+  ], separator = "\n")
+  ai.reply(history = [types.turn(role = types.user_role(), text = briefing)])
+}
+
+@"The three controls of one review: post as drafted, rewrite in place, or discard. The form ships
+the draft as its field's PREFILL, so what the facilitator submits is exactly what posts — no
+re-derivation sits between the submit and the deed."
+agent review_controls(draft: string) -> array[slack.control] {
+  [
+    slack.button(id = "post", label = "Post it"),
+    slack.button(id = "discard", label = "Discard"),
+    slack.form(id = "edit", label = "Edit", title = "Standup digest", fields = [
+      slack.field(id = "digest", label = "The digest, as it will post", value = draft, multiline = true),
+    ]),
+  ]
+}
+
+@"The facilitator's decision, read: the digest POSTS, at exactly @text@ — the draft as approved, or
+the rewrite as submitted."
+data post_approved(text: string)
+
+@"The facilitator's decision, read: nothing posts, and @reason@ is the one line worth keeping."
+data digest_discarded(reason: string)
+
+// One review's outcome, read from the Slack answer ONCE. (Type synonyms take no docs.)
+type review = post_approved | digest_discarded
+
+@"Read the answer into the app's own sum, so acting on it is a single dispatch. Ids are matched as
+literals — the branch turns on keys the program wrote, never on display text — and a submitted but
+CLEARED draft reads as a discard: a facilitator who deleted the text they were shown is not asking
+to post an empty message."
+agent read_review(answer: slack.answer, draft: string) -> review {
+  match (answer) {
+    case slack.clicked(id => "post", by => _) -> post_approved(text = draft)
+    case slack.submitted(id => _, values => values, by => _) -> {
+      let edited = match (record.get(target = values, key = "digest")) {
+        case null -> ""
+        case text -> text
+      }
+      if (string.is_blank(value = edited)) {
+        digest_discarded(reason = "the facilitator cleared the draft")
+      } else {
+        post_approved(text = edited)
+      }
+    }
+    case rest -> digest_discarded(reason = "the facilitator pressed Discard")
+  }
+}
+
+@"See one draft through review: check the controls where they are built, put the question to the
+facilitator with a deadline, read the answer once, and act on it. The deadline exists because
+`time.watch` serializes deliveries — a review nobody answers must not hold tomorrow's standup
+hostage."
+agent review_and_post(configuration: settings, date: string, draft: string) -> null with slack.connection | io | prelude.throw[slack.slack_error] {
+  let controls = review_controls(draft = draft)
+  match (slack.check_controls(controls = controls)) {
+    case slack.invalid(reason => reason) -> {
+      // Unreachable while the controls above stay within Slack's caps (the draft is pre-fitted),
+      // but the check answers with a value and the honest fold is to say so, not to throw.
+      tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: could not present the digest for review — ${reason})")
+    }
+    case slack.valid(_) -> {
+      agent hold_review(value: null) -> slack.answer with slack.connection | io | prelude.throw[slack.slack_error] {
+        slack.ask(
+          channel = configuration.facilitator_channel,
+          prompt = slack.fit_message(
+            text = f"Standup digest for ${date} — press *Post it*, open *Edit* to rewrite it, or *Discard*.\n\n${draft}",
+            marker = "\n… (preview cut; open Edit for the full draft)",
+          ),
+          controls = controls,
+        )
+      }
+      // Six hours: generous for a human, comfortably inside the gap to the next weekday firing.
+      match (time.with_deadline(milliseconds = 21600000, task = hold_review)) {
+        case time.deadline_passed(_) -> {
+          tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: the review expired unanswered after six hours — nothing was posted.)")
+        }
+        case time.completed(value => answer) -> {
+          match (read_review(answer = answer, draft = draft)) {
+            // A discard is a human decision, not a failure — but it still has to be legible. A
+            // CLEARED draft leaves the form's own "Edit" beside the answered ask, which reads like
+            // an edit that posted, so the reason says which of the two endings it was.
+            case digest_discarded(reason => reason) -> {
+              tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: nothing posted — ${reason}.)")
+            }
+            case post_approved(text => text) -> {
+              match (slack.try_send(channel = configuration.standup_channel, text = text)) {
+                case slack.delivered(_) -> null
+                case slack.dropped(reason => reason) -> {
+                  // The approval already happened, so the failure must carry the approved text:
+                  // the facilitator can post it by hand instead of re-running the morning.
+                  tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: the approved digest did NOT post — ${reason}. Post it by hand:)\n${text}")
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ─── the composition root ─────────────────────────────────────────────────────────────────────────
+
+@"Entry: read and validate the configuration, provide the model, then open the RECONNECTABLE Slack
+session — the connection, the scribe desk, the region and its policies — and serve until cancelled.
+Every anticipated stop lands in the root handlers as one readable line."
+agent main() -> string with io | store.get | store.set {
+  use handler { request panic(msg: string) { break f"standup-scribe stopped on a defect: ${msg}" } }
+  use handler {
+    request prelude.throw(error: app_error) -> never {
+      break f"standup-scribe stopped: ${json.stringify(value = error)}"
+    }
+  }
+  let standup_channel = match (env.get(key = "STANDUP_CHANNEL")) {
+    case null -> prelude.throw(error = missing_config(name = "STANDUP_CHANNEL"))
+    case value -> value
+  }
+  let standup_hour = env.get_integer_or(key = "STANDUP_HOUR", fallback = 9)
+  if (standup_hour < 0 || standup_hour > 23) {
+    prelude.throw(error = bad_hour(hour = standup_hour))
+  } else {
+    null
+  }
+  let window_minutes = env.get_integer_or(key = "WINDOW_MINUTES", fallback = 60)
+  if (window_minutes < 1) {
+    prelude.throw(error = bad_window(minutes = window_minutes))
+  } else {
+    null
+  }
+  let timezone = env.get_or(key = "STANDUP_TIMEZONE", fallback = "UTC")
+  // Validate the zone at boot: `time.cron` panics on a zone it does not know, and that panic would
+  // land inside the schedule fiber, where the crash policy would rebuild the session over and over.
+  match (time.zone_offset(epoch_milliseconds = time.now(), zone = timezone)) {
+    case null -> prelude.throw(error = bad_timezone(zone = timezone))
+    case _ -> null
+  }
+  let configuration = settings(
+    standup_channel = standup_channel,
+    facilitator_channel = env.get_or(key = "FACILITATOR_CHANNEL", fallback = standup_channel),
+    standup_hour = standup_hour,
+    timezone = timezone,
+    window_minutes = window_minutes,
+  )
+  use anthropic.provider(
+    source = credentials.env(key = "ANTHROPIC_API_KEY"),
+    system = "You are a standup scribe. You draft digests from teammates' replies: faithful to what was written, compact, no invention — an entry you were not given does not exist.",
+  )
+  // EVERYTHING BELOW IS THE SESSION, AND THE SESSION IS A REPLAY SCOPE — this is what lets the scribe
+  // survive a runtime restart. A sidecar's client handle lives in the sidecar process, not in the
+  // durable log, so a recovered run holds a handle to a connection that no longer exists and its next
+  // Slack call panics as `interrupted`. The converter turns that panic — and a refusal at connect,
+  // which is the same story a minute later — into a replay signal, and because `slack.provider` sits
+  // INSIDE this scope, every attempt reconnects with a fresh handle. What is deliberately NOT
+  // converted is a throw: `auth_error`, a missing secret and `fiber_failure` ride past to the root
+  // handlers and stop the run, because nothing about those heals by trying again.
+  use replay.forever(initial_delay_milliseconds = 1000, factor = 2, max_delay_milliseconds = 60000)
+  use handler {
+    request panic(msg: string) -> never { replay.interrupted(failure = msg) }
+    request prelude.throw(error: app_error) -> never {
+      match (error) {
+        // A refused connect is weather: try again after the backoff.
+        case slack.api_error(message => message) -> replay.interrupted(failure = f"the Slack connection failed (${message})")
+        // The rest re-raises AS BOUND for the root handlers — a dead token, a missing secret and a
+        // fiber's own fatal failure are not fixed by reconnecting.
+        case rest -> prelude.throw(error = rest)
+      }
+    }
+  }
+  use slack.provider(
+    bot_source = credentials.env(key = "SLACK_BOT_TOKEN"),
+    app_source = credentials.env(key = "SLACK_APP_TOKEN"),
+  )
+  // THE SCRIBE DESK — one sequential handler, so its `var` is an actor's state and collecting never
+  // interleaves with opening or closing a window.
+  use handler (var window: window_state = idle()) {
+    request channel_message(author: string, text: string, thread: string | null) {
+      match (window) {
+        case idle(_) -> { next null }
+        case collecting(date => date, prompt_ts => prompt_ts, entries => entries) -> {
+          match (thread) {
+            // Only replies threaded under the day's prompt are entries; top-level chatter and other
+            // threads stay none of the scribe's business.
+            case null -> { next null }
+            case reply_thread -> {
+              if (reply_thread == prompt_ts) {
+                // Tag the raw `U…` id before it is stored or shown to a model: a workspace's ids
+                // are a small, guessable space, and the keyed tag is the package's sound pseudonym.
+                let tag = slack.author_tag(source = credentials.env(key = "SLACK_BOT_TOKEN"), author = author)
+                next null with { window = collecting(date = date, prompt_ts = prompt_ts, entries = array.append(target = entries, value = entry(author = f"teammate-${tag}", text = text))) }
+              } else {
+                next null
+              }
+            }
+          }
+        }
+      }
+    }
+    request window_started(date: string, prompt_ts: string) {
+      match (window) {
+        case idle(_) -> { next null with { window = collecting(date = date, prompt_ts = prompt_ts, entries = []) } }
+        // Opening a window while one is already open cannot happen as the fibers run today — the schedule
+        // fiber closes every window it opens, and a rebuilt session starts this desk over. These two arms
+        // are the state machine's TOTALITY rather than expected traffic, and they are worth keeping split
+        // because each protects a different thing the other would lose.
+        case collecting(date => open_date, prompt_ts => open_ts, entries => entries) -> {
+          if (open_date == date && open_ts == prompt_ts) {
+            // The same window: keep what was collected, so a re-open can never discard entries.
+            next null
+          } else {
+            // A different window: replace, so one instance's leftovers can never leak into another
+            // day's digest.
+            next null with { window = collecting(date = date, prompt_ts = prompt_ts, entries = []) }
+          }
+        }
+      }
+    }
+    request window_finished() {
+      match (window) {
+        case idle(_) -> { next [] }
+        case collecting(date => _, prompt_ts => _, entries => entries) -> {
+          next entries with { window = idle() }
+        }
+      }
+    }
+  }
+  let nursery: region.nursery[scribe_scope, fiber_ceiling] = use region.provide[scribe_scope, fiber_ceiling]
+  use handler {
+    request region.crashed(id: string, name: string, message: string) {
+      // A fiber panic is an external call interrupted under the at-most-once rule — after a runtime
+      // restart, every call this program makes, because the connection behind them is gone. Re-forking
+      // the fiber ALONE would hand the replacement the same dead handle and it would die the same way,
+      // so the whole session replays instead: one restart mechanism, with the reconnect inside it.
+      // Nothing is posted from here, because the connection that would carry the notice is precisely
+      // what failed; the crash and each attempt are in the run's events.
+      replay.interrupted(failure = f"fiber ${name} crashed: ${message}")
+    }
+    request region.failed(id: string, name: string, error: unknown) {
+      // Only failures the occurrence guard refuses to fold reach here — auth, configuration drift.
+      // Nothing about those self-heals, so stop the run loudly rather than keep a resident that
+      // looks alive and does nothing.
+      prelude.throw(error = fiber_failure(name = name, detail = json.stringify(value = error)))
+    }
+  }
+  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = "channel-watcher")
+  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = "standup-schedule")
+  region.watch(nursery = nursery)
+}

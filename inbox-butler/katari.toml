@@ -1,0 +1,11 @@
+[package]
+name = "inbox_butler"
+description = "An inbox butler: triages new Gmail into calendar-event proposals and creates nothing without your click on Discord."
+
+[runtime]
+url = "http://localhost:3000"
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "snapshot-2026-07-29-56e87e45"
+packages = ["gmail", "google_calendar", "ai", "discord"]
