@@ -1,6 +1,6 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-30-b49b81c9"
+snapshot = "snapshot-2026-07-30-ae82151a"
 katari_compiler = "0.1.0"
 
 [packages.ai]
@@ -18,14 +18,14 @@ sha256 = "99a952ff5935ece89bf3f602c8067bef02a249be23c4f1cdab79b77e449a67db"
 [packages.gmail]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-gmail"
-rev = "f3ee977410df1728f84321d4ee3d832209ce1472"
-sha256 = "338ee913602dbb364e4410d390e7c8f696c842c1f80a52c08f18123cd3c14bc2"
+rev = "f94812a503c4a49fc88bc4728202c2d6d5bce602"
+sha256 = "e548a3c3d0dd6740dc12e42bc2c865642445831767bfde9352adc9977b2bf6d6"
 
 [packages.google_calendar]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-google_calendar"
-rev = "2b95204a874f5b71d46b4f1787b1570ec778cbb3"
-sha256 = "62c475c6ae5812495dd6c23f6d7d03c88c9496fa12db0089fa4b9d70e8832db3"
+rev = "205ec90b3bcff6b3d9c61fb4cf8626532fade429"
+sha256 = "0acf9e2de224531788e568b3aa5647a06cc7d0c4bf390cee0e837a196ef964bd"
 
 [packages.google_common]
 source = "git"

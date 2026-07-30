@@ -41,10 +41,12 @@ effect concierge_scope
 type concierge_ceiling = face_message | control_message | question_flagged | discord.credential | io
 
 // Everything the composition root anticipates being thrown at it: a tool set holding two tools
-// of one name, a gateway/API failure, and the two credential-resolution failures. A model STEP
-// failure never lands here — `ai.advance_desk` folds it into its outcome, and the face desk
-// reads that outcome as a value.
-type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error
+// of one name, a gateway/API failure, the two credential-resolution failures, and a note whose
+// stored shape no longer reads back (memory decides a retraction inside its critical section, so
+// its answer crosses a `json` boundary the control desk calls directly). A model STEP failure
+// never lands here — `ai.advance_desk` folds it into its outcome, and the face desk reads that
+// outcome as a value.
+type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error | json.validation_error
 
 // ── the face: its standing instructions, its per-turn note, its one outward tool ──────────────────
 
@@ -363,14 +365,16 @@ agent serve(public_channel: string, control_channel: string) -> string {
           next null
         }
         case retract_note(key => key) -> {
-          // Read-then-act without a race: this desk is the only writer, and it is serial. The
-          // check exists because `memory.forget` reports a missing key as success (a no-op),
-          // and an owner who retracts a typo must not believe they removed something.
-          if (record.has(target = memory.index(), key = key)) {
-            let _confirmation = memory.forget(key = key)
-            operator_note(text = f"(retracted \"${key}\" — the face no longer knows it.)")
-          } else {
-            operator_note(text = f"(nothing is published under \"${key}\" — send `notes` to see the keys.)")
+          // The call itself says which ending it had, so an owner who retracts a typo is never
+          // told something was removed. Reading the index first would answer the same question
+          // one race narrower — memory decides this inside the section that does the removal.
+          match (memory.forget(key = key)) {
+            case memory.forgot(_) -> {
+              operator_note(text = f"(retracted \"${key}\" — the face no longer knows it.)")
+            }
+            case memory.was_absent(_) -> {
+              operator_note(text = f"(nothing is published under \"${key}\" — send `notes` to see the keys.)")
+            }
           }
           next null
         }

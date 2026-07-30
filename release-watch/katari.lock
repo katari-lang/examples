@@ -1,6 +1,6 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-30-b49b81c9"
+snapshot = "snapshot-2026-07-30-ae82151a"
 katari_compiler = "0.1.0"
 
 [packages.discord]

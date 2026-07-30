@@ -1,6 +1,6 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-30-b49b81c9"
+snapshot = "snapshot-2026-07-30-ae82151a"
 katari_compiler = "0.1.0"
 
 [packages.ai]
@@ -18,5 +18,5 @@ sha256 = "99a952ff5935ece89bf3f602c8067bef02a249be23c4f1cdab79b77e449a67db"
 [packages.memory]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-memory"
-rev = "44bbc5bf5ec824b2736b96e6c16b3dea8b511262"
-sha256 = "7cbd3167f3acda0f2931ded2e0212f5a266d0d500272b6fddb5b4a645b9a7435"
+rev = "cbf3af09804230d466d8037ad39bee3f569e0938"
+sha256 = "febe671d52cb6199decac26a07d34a3371fa6d6e1041879d85f15a6b5c945663"
