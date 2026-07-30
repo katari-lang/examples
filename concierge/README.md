@@ -11,7 +11,7 @@ time. What the face knows is exactly what was published — nothing else crosses
 
 - **Two desks and mail on one region bus** — one request plus one sequential handler per
   serialization domain, and agent-to-agent mail as a fiber whose whole body is one perform:
-  [A second agent: desks and mail](https://katari-lang.dev/docs/v0.1/guides/second-agent).
+  [A second agent: desks and mail](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent).
 - **Handler geometry** — why the providers sit above the nursery, the flag bridge above the
   face desk, and the crash policy below the desks; and failure carried back as a *value*
   (`send_outcome`, `desk_outcome`) instead of a throw across a handler boundary:
@@ -120,7 +120,7 @@ command grammar.
 ## How it is built
 
 Everything is one file, [`src/concierge.ktr`](src/concierge.ktr) — a mini version of the
-[second-agent guide](https://katari-lang.dev/docs/v0.1/guides/second-agent)'s office, with real
+[second-agent chapter](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent)'s office, with real
 packages on the bus.
 
 - **Two source fibers** (`face_source`, `control_source`) each serve one channel with

@@ -30,7 +30,7 @@ through — spelled out under [Durability, honestly](#durability-honestly).
   [Handler geometry](https://katari-lang.dev/docs/v0.1/guides/handler-geometry).
 - **A desk and its region**: a sequential handler as the collection actor, fibers as sources, and a
   crash policy that forks a dead fiber again rather than inventing an answer:
-  [A second agent](https://katari-lang.dev/docs/v0.1/guides/second-agent),
+  [A second agent](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent),
   [A Discord bot](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) (the resident shape).
 - **Surviving a runtime restart with a sidecar**: every Slack call carries the tokens it acts with, so
   a restart costs the interrupted call and nothing else — no session to rebuild, no replay scope, and

@@ -38,13 +38,20 @@ Each example's README has the full walkthrough. The shared shape:
 
 ```sh
 cd <example>
-cp .env.example .env          # then fill in the ids the README lists
-docker compose up -d          # runtime + Postgres + blob store, self-hosted
+katari lock                        # fetches the pinned packages into .katari/
+(cd .katari/packages/discord-* && npm install)   # the sidecar's own dependencies, once
+cp .env.example .env               # then fill in the ids the README lists
+docker compose up -d               # runtime + Postgres + blob store, self-hosted
 export $(grep '^KATARI_API_KEY=' .env)
 katari env set <SECRET> --secret   # per-example tokens; each README lists its own
 katari apply
 katari run <package>.main --detach
 ```
+
+The first two lines are the ones a fresh clone needs and a re-run does not. `check`, `build` and
+`apply` are offline readers, so nothing fetches the packages until `lock` does; and every example
+here depends on `discord` or `slack`, each of which carries an FFI sidecar whose own dependencies
+the bundler needs (`slack-*` instead of `discord-*` for `standup-scribe`).
 
 The CLI is the published one: `npm install -g @katari-lang/cli`.
 

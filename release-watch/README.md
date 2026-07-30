@@ -30,7 +30,7 @@ durable-monitor skeleton, with nothing else on the page.
   ([FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars)).
 - **Desired set vs live state** — an instance's failure never edits the persistent record of what
   is desired: only `unwatch` (a decision) removes a watch
-  ([A second agent](https://katari-lang.dev/docs/v0.1/guides/second-agent),
+  ([A second agent](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent),
   [Parallelism](https://katari-lang.dev/docs/v0.1/concepts/parallelism)).
 
 ## Setup
