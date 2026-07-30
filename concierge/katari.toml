@@ -7,5 +7,5 @@ url = "http://localhost:3000"
 
 [dependencies]
 registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
-snapshot = "snapshot-2026-07-30-ae82151a"
+snapshot = "snapshot-2026-07-30-f55993f8"
 packages = ["discord", "ai", "memory"]
