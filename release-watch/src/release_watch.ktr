@@ -23,18 +23,19 @@ effect monitor_scope
 // `region.watch` are written against. Each fiber declares only the part it actually performs, so the
 // escalation report stays a true capability read. Throws are absent by the region's contract — an
 // uncaught fiber throw arrives at the watch as the typed `region.failed` event instead.
-type monitor_ceiling = control_message | store.shared | discord.connection | io
+type monitor_ceiling = control_message | store.shared | discord.credential | io
 
-@"A fiber's THROW escaped every fold it had — a fault no reconnect and no future tick heals (a
+@"A fiber's THROW escaped every fold it had — a fault no fresh fork and no future tick heals (a
 revoked token, a stored shape that stopped parsing), so it is re-raised to the fatal sink and the run
-stops loudly. A fiber PANIC is a different ending and takes the restart loop instead."
+stops loudly. A fiber PANIC is a different ending: the crash policy forks the task again."
 data fiber_died(@"The fiber's name." name: string, @"The thrown value, rendered." detail: string)
 
 // ── the sources ───────────────────────────────────────────────────────────────────────────────────
 
 @"The control source: serve the watch channel forever, reporting each incoming message to the
-desk. The bot's own posts are not delivered, so replying cannot loop."
-agent control_source(input: string) -> never with control_message | discord.connection | io {
+desk. The bot's own posts are not delivered, so replying cannot loop. Opening the gateway is the watch's
+own job, so a Discord refusal is a throw from HERE and the region's `failed` policy stops the run on one."
+agent control_source(input: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error] {
   agent deliver(value: discord.message) -> null with control_message {
     control_message(message = value)
   }
@@ -48,9 +49,9 @@ where a poll is cheap and order is irrelevant. `time.watch`'s timer is durable (
 the persisted next occurrence); the interval is read once at start (`POLL_MINUTES`, default 10) and
 clamped to at least a minute, since `time.interval` demands a positive period and a `0` in the env
 would otherwise take the fiber down at its first breath."
-agent poll_source(input: string) -> never with store.shared | discord.connection | io | prelude.throw[json.validation_error | discord.auth_error] {
+agent poll_source(input: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
   let interval_minutes = math.max(left = env.get_integer_or(key = "POLL_MINUTES", fallback = 10), right = 1)
-  agent tick(time: number) -> null with store.shared | discord.connection | io | prelude.throw[json.validation_error | discord.auth_error] {
+  agent tick(time: number) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
     let _checked = for (let row in watch_list.read_watches()) {
       next match (watch_list.validate_watch(value = row.spec)) {
         // An unreadable row is boot's to delete and `list`'s to show; a tick passes it by.
@@ -81,7 +82,7 @@ the backlog); a release past the baseline is announced; a dropped announcement H
 the next tick retries it (no retry is baked in anywhere else). The announcement rides AHEAD of the
 state write, so a crash in that seam re-announces once rather than losing a release: announcements
 are at-least-once, as the README says."
-agent check_repository(channel: string, name: string, repository: commands.repository_spec) -> null with store.shared | discord.connection | io | prelude.throw[json.validation_error | discord.auth_error] {
+agent check_repository(channel: string, name: string, repository: commands.repository_spec) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
   let previous = match (watch_list.read_state(name = name)) {
     case null -> watch_list.no_baseline()
     case state -> state.cursor
@@ -89,7 +90,7 @@ agent check_repository(channel: string, name: string, repository: commands.repos
   agent commit(cursor: watch_list.cursor, outcome: watch_list.check_outcome) -> null with store.shared {
     watch_list.write_state(name = name, state = watch_list.watch_state(cursor = cursor, outcome = outcome))
   }
-  agent announce(release: github.github_release) -> null with store.shared | discord.connection | io | prelude.throw[discord.auth_error] {
+  agent announce(release: github.github_release) -> null with store.shared | discord.credential | io | prelude.throw[discord.auth_error] {
     match (discord.try_send(channel = channel, text = announcement(repository = repository, release = release))) {
       case discord.delivered(_) -> commit(cursor = watch_list.announced_up_to(tag = release.tag), outcome = watch_list.release_announced(tag = release.tag))
       case discord.dropped(reason => reason) -> commit(cursor = previous, outcome = watch_list.announcement_dropped(tag = release.tag, reason = reason))
@@ -162,7 +163,7 @@ agent serve_command(parsed: commands.command) -> string with store.shared | prel
 @"Boot's probe and report in one post: the online line (watch count, rows dropped by the sweep)
 sent with `send_message` — NOT `try_send`, so a typo'd channel id fails the boot loudly instead of
 making every later announcement a silently-dropped post. Answers \"\" on a clean boot."
-agent boot_probe(channel: string, swept: fleet.sweep_result[commands.repository_spec]) -> string with discord.connection | io {
+agent boot_probe(channel: string, swept: fleet.sweep_result[commands.repository_spec]) -> string with discord.credential | io {
   use handler {
     request prelude.throw(error: discord.discord_error) -> never {
       break f"failed: could not post to WATCH_CHANNEL — the channel id looks wrong or the bot lacks access there (${json.stringify(value = error)})."
@@ -178,19 +179,16 @@ agent boot_probe(channel: string, swept: fleet.sweep_result[commands.repository_
 }
 
 @"Entry: run the release monitor. Boot refuses loudly on missing config, sweeps the durable watch
-list (validate-or-drop), proves the channel is postable with one online line, then serves forever
-under a restart loop that reconnects and re-boots after a runtime restart — run it detached:
-`katari run release_watch.main --detach`."
+list (validate-or-drop), proves the channel is postable with one online line, then serves forever —
+a runtime restart costs the interrupted call and nothing else, and the crash policy below forks the
+dead watch again. Run it detached: `katari run release_watch.main --detach`."
 agent main() -> string {
-  // A panic raised ABOVE the restart loop — in the config read below, or in these two handlers' own
-  // bodies — has no connection to re-establish, so it ends the run with one line. Every panic after
-  // the loop is installed belongs to the loop's converter instead.
+  // A panic that reaches HERE ends the run with one line: it is a call the runtime interrupted on this
+  // desk's own path. A FIBER's panic never arrives here — it is `region.crashed` below, forked again.
   use handler { request panic(msg: string) { break f"failed: ${msg}" } }
   // The fatal sink. Anything still flying here — a missing or revoked Discord token, a stored shape
-  // that stopped parsing — is a failure no reconnect and no future tick heals, and a stopped run is
-  // a fact somebody notices, where an absorbed fatal is a monitor that silently watches nothing. It
-  // sits OUTSIDE the restart loop below on purpose: a fault the loop cannot fix must not be retried
-  // every second forever.
+  // that stopped parsing — is a failure no fresh fork and no future tick heals, and a stopped run is
+  // a fact somebody notices, where an absorbed fatal is a monitor that silently watches nothing.
   use handler {
     request prelude.throw(error: unknown) -> never { break f"fatal: ${json.stringify(value = error)}" }
   }
@@ -200,14 +198,9 @@ agent main() -> string {
   } else {
     null
   }
-  // THE RESTART LOOP, and everything below it is one attempt. A gateway client lives in the sidecar
-  // PROCESS, not in the durable log, so a runtime restart resumes this run holding a handle to a
-  // connection that no longer exists: the interrupted `watch_messages` call comes back as a panic,
-  // and any later send on that handle would too. The converter turns a panic into the replay signal
-  // and the loop re-runs the block — with `discord.provider` INSIDE it, so the retry logs in afresh
-  // instead of re-using the dead handle. Config reads stay above: they are not what a replay fixes.
-  use replay.forever(initial_delay_milliseconds = 1000, factor = 2, max_delay_milliseconds = 60000)
-  use handler { request panic(msg: string) -> never { replay.interrupted(failure = msg) } }
+  // The provider connects NOTHING: it serves the bot token, resolved per call, and a call that needs
+  // the gateway opens one for its own lifetime. So nothing here points into the sidecar's memory and
+  // there is no session to supervise — token plus channel is a whole reference, from any process.
   use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
   // The app's place and serial domain, then the shared place INSIDE it — that order is the
   // contract that lands `fleet`'s critical sections (name minting) in a real serial domain.
@@ -242,21 +235,30 @@ agent main() -> string {
     }
   }
   let nursery: region.nursery[monitor_scope, monitor_ceiling] = use region.provide[monitor_scope, monitor_ceiling]
+  // The fiber names, spelled once: the forks tag by them and the crash policy reads them back to pick
+  // which task to fork again (both take the same argument — the watch channel).
+  let control_name = "control-source"
+  let poll_name = "poll-loop"
   // The region's death policy, split by ENDING, because the two mean opposite things here. A fiber's
-  // PANIC is almost always the runtime having restarted under it (a dead gateway handle), which the
-  // restart loop above fixes by re-booting with a fresh connection — so it signals rather than dies.
-  // A fiber's escaped THROW is a fault no reconnect heals (a revoked token, a shape that stopped
-  // parsing): both fibers already fold every failure they anticipate (the probe's catch, `try_send`),
-  // so a throw that still arrives here rides to the fatal sink and stops the run.
+  // PANIC is almost always the runtime having restarted under it, interrupting whatever call was in
+  // flight — so FORK THE TASK AGAIN: the replacement resolves the token afresh and its new call opens
+  // the gateway, with nothing left over from the dead one. A fiber's escaped THROW is a fault no fresh
+  // fork heals (a revoked token, a shape that stopped parsing): both fibers already fold every failure
+  // they anticipate, so a throw that still arrives here rides to the fatal sink.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
-      replay.interrupted(failure = f"fiber ${name} panicked: ${message}")
+      let _replacement = if (name == poll_name) {
+        region.fork(nursery = nursery, task = poll_source, argument = channel, name = poll_name)
+      } else {
+        region.fork(nursery = nursery, task = control_source, argument = channel, name = control_name)
+      }
+      next null
     }
     request region.failed(id: string, name: string, error: unknown) {
       prelude.throw(error = fiber_died(name = name, detail = json.stringify(value = error)))
     }
   }
-  let _control = region.fork(nursery = nursery, task = control_source, argument = channel, name = "control-source")
-  let _poll = region.fork(nursery = nursery, task = poll_source, argument = channel, name = "poll-loop")
+  let _control = region.fork(nursery = nursery, task = control_source, argument = channel, name = control_name)
+  let _poll = region.fork(nursery = nursery, task = poll_source, argument = channel, name = poll_name)
   region.watch(nursery = nursery)
 }

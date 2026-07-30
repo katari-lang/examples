@@ -25,9 +25,10 @@ it comes back.
 - **The converter idiom** — a resident source that folds transient poll failures into a durable
   backoff instead of dying:
   [Scheduled jobs](https://katari-lang.dev/docs/v0.1/guides/scheduled-jobs).
-- **Surviving your own restarts** — one classifier deciding fatal from retryable, a supervisor that
-  restarts the resident with a fresh sidecar connection, and why the providers must sit inside the
-  attempt: [FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars).
+- **Surviving a runtime restart without a supervisor** — one classifier deciding fatal from
+  reportable, and a `region.crashed` clause that forks the dead mail watch again, because every call
+  carries the credential it acts with and nothing durable points into the sidecar:
+  [FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars).
 - **Exactly-once at the destination** — an at-least-once watch made idempotent with a store marker
   keyed on the message id: [Store](https://katari-lang.dev/docs/v0.1/guides/store) and
   [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution).
@@ -108,8 +109,8 @@ A missing secret, a bad channel id or an unresolvable timezone stops the boot wi
 line naming the fix. If the `google` credential has never been authorized, the run **parks** on an
 authorize escalation — open it in the console, log in once, and the run resumes. A clean boot posts two
 lines to your channel: `(inbox-butler online — clock Asia/Tokyo)` from the boot check, then
-`(watching your inbox)` from the resident itself — the second one reappears whenever the butler
-restarts itself, which is how you can tell.
+`(watching your inbox)` from the resident itself. Both are posted once per run, and a runtime restart
+does not repeat them — nothing about the resident is re-run.
 
 ### Try this
 
@@ -159,14 +160,15 @@ One region, one desk, two kinds of fiber — all in
   `classify` — the single place the unhealable set is named — decides fatal (a revoked credential:
   the run stops loudly) versus one reported errand. The calendar package carries no location field,
   so the location box rides the event description.
-- **The supervisor** (`ai.supervise` in `main`) runs one `session` attempt at a time and starts a
-  fresh one on every reason an attempt hands back, 30 s doubling to 15 minutes while the same failure
-  repeats. The providers live **inside** the attempt on purpose: a sidecar's client handle is
-  process-local, so the handle a runtime restart replays names a connection that no longer exists and
-  only a fresh `discord.provider` mints a live one — see
-  [FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars). The mail source's death is
-  treated as the butler going deaf: it ends the attempt rather than being reported, because a report
-  cannot fix a watch that is gone.
+- **No supervisor, and nothing to supervise.** Every package call carries the credential it acts with,
+  so nothing the resident installs can be invalidated by a runtime restart — there is no connection to
+  rebuild and therefore no attempt loop. Each interrupted call is answered where it happens instead:
+  the **mail watch** arrives at `region.crashed` and is **forked again** (its cursor is a store row, so
+  the downtime is delivered, not skipped); a pending **ask** becomes `not_asked` at the adapter, which
+  the gate reports and the desk survives; an interrupted **http** call is a typed `fetch_error` the
+  triage guard already folds. A gate's panic is reported rather than re-forked, because re-asking a
+  question the operator may already have answered is worse than saying nothing was asked. See
+  [FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars#what-a-restart-costs-and-what-a-re-fork-gets-back).
 
 Honest fine print:
 
@@ -175,27 +177,29 @@ Honest fine print:
 - The marker is written **before** the triage call, so a mail is asked about **at most once**: a
   redelivery costs neither a second model call nor a second question. The price runs the other way — a
   mail the butler could not triage (a Gmail or model blip) is reported to the channel once and **not
-  tried again**, and a mail an attempt died in the middle of is marked handled and skipped by the next
-  attempt. Both stay in your inbox, which is where you would have read them anyway.
+  tried again**, and a mail whose triage the runtime interrupted is marked handled and skipped. Both
+  stay in your inbox, which is where you would have read them anyway.
 - A pending question does **not** survive a runtime restart: the interrupted ask comes back as "the
   question never reached the operator", the gate says so in the channel, and the desk carries on. The
   posted controls go stale and that candidate is not re-asked — the mail is still in your inbox, so
   nothing is lost silently.
-- **A transient failure restarts the butler, it does not end it.** A token endpoint that blipped, a
-  Google 5xx that escaped a fiber, the dead sidecar handles a cold restart replays, a source fiber that
-  died — each ends the current attempt, and the supervisor starts a fresh one with a fresh Discord
-  connection, saying so in the channel (`(the butler stopped on … and is starting over …)`, then
-  `(watching your inbox)`). A failure that repeats says so once with a count instead of shouting the
-  same sentence every quarter hour.
-- What a restart keeps and what it drops: everything durable is in the **store** — the
-  `inbox_butler/handled/<id>` markers and the gmail cursor — so a fresh attempt skips what was already
-  handled and picks up the mail that arrived meanwhile, oldest first. Everything held in a handler
-  starts empty again, and questions waiting in the channel are dead (they read `(expired)`); their mail
-  is still in your inbox.
-- Only what no backoff can heal ends the run: a revoked Discord token, a Google 401/403 while triaging
+- **A lost errand is one line, not a restart.** A Google 5xx that escaped a gate, a network drop, an
+  unforeseen failure — each is reported in the channel (`(gate:mail:… failed: …. That errand did not
+  complete; the butler keeps running.)`) and the next mail is unaffected. Nothing is re-tried behind
+  your back, because a retry of a half-finished errand is how a calendar gets two of the same event.
+- **What a runtime restart keeps, and what it costs.** It keeps everything: the store's
+  `inbox_butler/handled/<id>` markers and the gmail cursor, so the mail that arrived meanwhile is
+  triaged oldest first and what was handled stays handled. What it costs is the one call it interrupted
+  — normally the mail watch, which is forked again with one line in the channel
+  (`(the mail watch stopped: …. Starting it again …)`), and any question standing in the channel, which
+  goes stale and reads `(expired)`; its mail is still in your inbox. There is no attempt to restart and
+  no reconnect to wait for: `(watching your inbox)` is posted once per run, not once per recovery.
+- Only what nothing can heal ends the run: a revoked Discord token, a Google 401/403 while triaging
   or creating, a secret that has been unset. That is one `fatal:` console line, deliberately — a butler
   that looks alive and quietly does nothing is worse. (A Google credential whose refresh has died is
-  not this case: it parks on a re-authorization prompt, as in step 4.)
+  not this case: it parks on a re-authorization prompt, as in step 4.) A **panic** on the resident's own
+  path — a Discord post the runtime interrupted between the desk and the channel — ends the run the same
+  visible way, as one `failed:` line, rather than being retried in silence.
 - Discord replies use `try_send`, and a confirmation that cannot be posted is deliberately dropped: this
   channel is the reporting surface, so a line about the channel has no second audience.
 

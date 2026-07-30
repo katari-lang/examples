@@ -24,9 +24,9 @@ durable-monitor skeleton, with nothing else on the page.
 - **String boundary → sum dispatch** — channel text is parsed once into a `command` sum; every
   branch after that is a `match`
   ([Language reference](https://katari-lang.dev/docs/v0.1/concepts/language-reference)).
-- **Surviving a runtime restart** — a `replay.forever` scope with the panic converter the sidecar
-  guide prescribes, holding `discord.provider` inside it, so a restart reconnects instead of taking the
-  resident down with the connection
+- **Surviving a runtime restart** — the region's crash policy is one clause: a fiber that panicked
+  is **forked again**, because every call carries the token it acts with and nothing durable points
+  into the sidecar's memory. No replay scope, no panic converter, no session to rebuild
   ([FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars)).
 - **Desired set vs live state** — an instance's failure never edits the persistent record of what
   is desired: only `unwatch` (a decision) removes a watch
@@ -123,12 +123,15 @@ bot:  New release on vercel/next.js: v15.4.5 (v15.4.5)
       <the release notes, cut to fit one Discord message when long>
 ```
 
-Restart the runtime (`docker compose restart`) and the monitor comes back by itself. A gateway
-connection lives in the sidecar process, not in the durable log, so the restart leaves the run holding
-a dead handle — the run's restart loop catches that as a panic, logs in again and re-runs boot. You
-will see a second `(release-watch online — …)` line, because the sweep and the channel probe run again
-with it; that repeated line is the visible price of the reconnect. The watch list and every cursor are
-store rows, and the poll timer re-arms from its persisted next occurrence.
+Restart the runtime (`docker compose restart`) and the monitor comes back by itself, quietly. The
+restart interrupts whatever call was in flight — the control fiber's `watch_messages`, always, and a
+poll tick if one was mid-request — and each interrupted fiber arrives at `region.crashed`, where the
+policy **forks the same task again**: the fresh call resolves the bot token and opens its own gateway
+socket, so the channel is served again. Nothing else is rebuilt. Boot does **not** run a second time,
+so there is no repeated `(release-watch online — …)` line; the watch list and every cursor are store
+rows; a poll fiber that was merely sleeping between ticks is not interrupted at all, since a durable
+timer is not an external call. What the restart costs is the commands typed while nothing was
+listening — see the delivery note below.
 
 ## How it is built
 
@@ -163,13 +166,17 @@ Failure discipline, honestly stated:
   next tick, never lost. With `per_page=1`, two releases published inside one poll window are
   announced as one (the newest); the older one is skipped.
 - Discord's gateway delivers each message exactly once **within one connection** and promises nothing
-  across a reconnect, so a command typed while the bot is reconnecting can be missed outright. No
-  reply is the symptom; `list` is how you check whether it landed.
+  across a reconnect, so a command typed while the bot is reconnecting — or in the seconds between the
+  interrupted watch and its replacement fork — can be missed outright. No reply is the symptom; `list`
+  is how you check whether it landed.
 - A bot reply that Discord drops is not retried or re-reported — the only channel the desk can
-  speak in is the one that refused the post; retyping the command is the retry. A revoked token,
-  by contrast, stops the run loudly (`fatal: ...` as the run's result) — the restart loop deliberately
-  does not cover it, because no number of reconnects fixes a dead credential, and a stopped run is a
-  fact somebody notices.
+  speak in is the one that refused the post; retyping the command is the retry.
+- A fiber's **panic** is forked again; a fiber's **throw** stops the run. That split is the whole crash
+  policy: a panic means the runtime interrupted an in-flight call, which a fresh call fixes, while a
+  throw that escaped both fibers' own folds is a revoked token or a stored shape that stopped parsing —
+  one `fatal: ...` as the run's result, because no number of fresh forks fixes a dead credential, and a
+  stopped run is a fact somebody notices. `watch_messages` raises that throw itself now: the bot token
+  is checked when the gateway opens, not when the provider is installed.
 - Unauthenticated GitHub allows 60 requests an hour. Keep `(60 / POLL_MINUTES) * watched
   repositories` under that, or `list` will show rate-limit failures until the window clears.
 - The GitHub API rejects any request that carries no `User-Agent`. `web.fetch_page` sets no header of

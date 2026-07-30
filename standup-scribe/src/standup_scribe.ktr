@@ -28,7 +28,8 @@ opens a window."
 data missing_config(name: string)
 
 @"STANDUP_HOUR is outside 0-23. Thrown at boot: `time.cron` would panic inside the schedule fiber
-instead, and the crash policy would rebuild the session on every attempt."
+instead, and the crash policy — which forks a panicked fiber again — would fork it straight back into
+the same panic, forever."
 data bad_hour(hour: integer)
 
 @"WINDOW_MINUTES is not at least one minute. Thrown at boot for the quiet failure it otherwise is: a
@@ -64,12 +65,12 @@ request window_finished() -> array[entry]
 @"The region's scope marker: one nullary phantom per nursery."
 effect scribe_scope
 
-// What the schedule fiber may raise: the desk's window controls, the Slack connection it posts and
-// asks through, the model seam, and the store rows of its once-per-date marker. Throws are absent by
+// What the schedule fiber may raise: the desk's window controls, the Slack credentials it posts and
+// asks with, the model seam, and the store rows of its once-per-date marker. Throws are absent by
 // the region contract — an uncaught fiber throw surfaces as the typed `region.failed` event, never
 // as a throw. (Type synonyms take no docs.)
 type schedule_effects =
-  window_started | window_finished | slack.connection | ai.infer_step | store.get | store.set | io
+  window_started | window_finished | slack.credential | ai.infer_step | store.get | store.set | io
 
 // The nursery's ceiling is the union of every fiber kind; each fork stays bounded by its own row.
 // (Type synonyms take no docs.)
@@ -93,7 +94,7 @@ type window_state = idle | collecting
 
 @"One window as the STORE remembers it: the prompt's `ts` — the thread every entry hangs under — and
 the instant it closes. Keeping BOTH facts outside the fiber is what lets a window outlive the fiber
-that opened it, so a session rebuilt mid-window picks the day back up instead of losing it."
+that opened it, so a fiber forked again mid-window picks the day back up instead of losing it."
 data recorded_window(prompt_ts: string, close_at: number)
 
 @"Nothing is recorded for the date, so no window is open and there is none to resume."
@@ -158,7 +159,7 @@ Slack refusal into `dropped`, and a dropped facilitator note has nowhere left to
 channel IS the reporting channel — so the outcome is read and deliberately not re-raised (the run's
 event log still records the attempt). A dead token still stops the scribe: `try_send` re-raises
 `auth_error`."
-agent tell_facilitator(channel: string, text: string) -> null with slack.connection | io | prelude.throw[slack.auth_error] {
+agent tell_facilitator(channel: string, text: string) -> null with slack.credential | io | prelude.throw[slack.auth_error] {
   match (slack.try_send(channel = channel, text = text)) {
     case slack.delivered(_) -> null
     case slack.dropped(reason => _) -> null
@@ -169,18 +170,20 @@ agent tell_facilitator(channel: string, text: string) -> null with slack.connect
 
 @"The channel watcher, run as a fiber: serve the standup channel forever, reporting every incoming
 message to the scribe desk. Collection policy lives at the desk, not here — the watcher reports
-everything and stays ignorant of windows."
-agent channel_watcher(input: string) -> never with channel_message | slack.connection | io {
+everything and stays ignorant of windows. The watch opens the Socket Mode connection for its own
+lifetime, so a token Slack refuses is a throw HERE (the region's `failed` policy stops the run on
+one), and an interrupted watch is a panic the crash policy answers by forking this task again."
+agent channel_watcher(input: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error] {
   agent deliver(value: slack.message) -> null with channel_message {
     channel_message(author = value.author, text = value.text, thread = value.thread)
   }
   slack.watch_messages(channel = input, deliver_to = deliver)
 }
 
-@"The schedule fiber: pick up any window a rebuilt session left open, then fire every weekday at the
-configured hour — open the window, wait it out, close it, and see the digest through review. One fiber
-runs all of it deliberately: `time.watch` serializes deliveries so an occurrence can never overlap
-itself, and the desk stays free to collect while this fiber sleeps or waits on the facilitator."
+@"The schedule fiber: pick up any window an earlier instance of this fiber left open, then fire every
+weekday at the configured hour — open the window, wait it out, close it, and see the digest through
+review. One fiber runs all of it deliberately: `time.watch` serializes deliveries so an occurrence can
+never overlap itself, and the desk stays free to collect while this fiber sleeps or waits on a human."
 agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal] {
   @"The calendar date an instant falls on, read in the configured zone — what the marker and the digest
   are both named by. Boot validated the zone, so the null arm is configuration drift, not weather."
@@ -285,9 +288,9 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
       }
     }
   }
-  // RECOVERY, BEFORE THE WATCH — this is what a rebuilt session costs and how the cost is paid. `main`
-  // rebuilds the session on a panic (a restart kills the sidecar's connection), which forks this fiber
-  // fresh, and a fresh `time.watch` arms on the NEXT occurrence: today's open window would be left with
+  // RECOVERY, BEFORE THE WATCH — this is what a forked-again fiber costs and how the cost is paid. A
+  // runtime restart interrupts whichever Slack call this fiber was in, and the crash policy forks it
+  // fresh; a fresh `time.watch` arms on the NEXT occurrence, so today's open window would be left with
   // nobody to close it. The store holds the window's identity AND its lifetime, so the new fiber picks
   // it up and ends it on time. The watch arms after that, exactly as serialized deliveries would.
   let now = time.now()
@@ -384,7 +387,7 @@ agent read_review(answer: slack.answer, draft: string) -> review {
 facilitator with a deadline, read the answer once, and act on it. The deadline exists because
 `time.watch` serializes deliveries — a review nobody answers must not hold tomorrow's standup
 hostage."
-agent review_and_post(configuration: settings, date: string, draft: string) -> null with slack.connection | io | prelude.throw[slack.slack_error] {
+agent review_and_post(configuration: settings, date: string, draft: string) -> null with slack.credential | io | prelude.throw[slack.slack_error] {
   let controls = review_controls(draft = draft)
   match (slack.check_controls(controls = controls)) {
     case slack.invalid(reason => reason) -> {
@@ -393,7 +396,7 @@ agent review_and_post(configuration: settings, date: string, draft: string) -> n
       tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: could not present the digest for review — ${reason})")
     }
     case slack.valid(_) -> {
-      agent hold_review(value: null) -> slack.answer with slack.connection | io | prelude.throw[slack.slack_error] {
+      agent hold_review(value: null) -> slack.answer with slack.credential | io | prelude.throw[slack.slack_error] {
         slack.ask(
           channel = configuration.facilitator_channel,
           prompt = slack.fit_message(
@@ -435,9 +438,9 @@ agent review_and_post(configuration: settings, date: string, draft: string) -> n
 
 // ─── the composition root ─────────────────────────────────────────────────────────────────────────
 
-@"Entry: read and validate the configuration, provide the model, then open the RECONNECTABLE Slack
-session — the connection, the scribe desk, the region and its policies — and serve until cancelled.
-Every anticipated stop lands in the root handlers as one readable line."
+@"Entry: read and validate the configuration, provide the model and the Slack credentials, install the
+scribe desk, the region and its policies — and serve until cancelled. Every anticipated stop lands in
+the root handlers as one readable line."
 agent main() -> string with io | store.get | store.set {
   use handler { request panic(msg: string) { break f"standup-scribe stopped on a defect: ${msg}" } }
   use handler {
@@ -463,7 +466,7 @@ agent main() -> string with io | store.get | store.set {
   }
   let timezone = env.get_or(key = "STANDUP_TIMEZONE", fallback = "UTC")
   // Validate the zone at boot: `time.cron` panics on a zone it does not know, and that panic would
-  // land inside the schedule fiber, where the crash policy would rebuild the session over and over.
+  // land inside the schedule fiber, which the crash policy would fork straight back into it.
   match (time.zone_offset(epoch_milliseconds = time.now(), zone = timezone)) {
     case null -> prelude.throw(error = bad_timezone(zone = timezone))
     case _ -> null
@@ -479,27 +482,13 @@ agent main() -> string with io | store.get | store.set {
     source = credentials.env(key = "ANTHROPIC_API_KEY"),
     system = "You are a standup scribe. You draft digests from teammates' replies: faithful to what was written, compact, no invention — an entry you were not given does not exist.",
   )
-  // EVERYTHING BELOW IS THE SESSION, AND THE SESSION IS A REPLAY SCOPE — this is what lets the scribe
-  // survive a runtime restart. A sidecar's client handle lives in the sidecar process, not in the
-  // durable log, so a recovered run holds a handle to a connection that no longer exists and its next
-  // Slack call panics as `interrupted`. The converter turns that panic — and a refusal at connect,
-  // which is the same story a minute later — into a replay signal, and because `slack.provider` sits
-  // INSIDE this scope, every attempt reconnects with a fresh handle. What is deliberately NOT
-  // converted is a throw: `auth_error`, a missing secret and `fiber_failure` ride past to the root
-  // handlers and stop the run, because nothing about those heals by trying again.
-  use replay.forever(initial_delay_milliseconds = 1000, factor = 2, max_delay_milliseconds = 60000)
-  use handler {
-    request panic(msg: string) -> never { replay.interrupted(failure = msg) }
-    request prelude.throw(error: app_error) -> never {
-      match (error) {
-        // A refused connect is weather: try again after the backoff.
-        case slack.api_error(message => message) -> replay.interrupted(failure = f"the Slack connection failed (${message})")
-        // The rest re-raises AS BOUND for the root handlers — a dead token, a missing secret and a
-        // fiber's own fatal failure are not fixed by reconnecting.
-        case rest -> prelude.throw(error = rest)
-      }
-    }
-  }
+  // THE CREDENTIALS, AND NOTHING MORE: installing this provider CONNECTS NOTHING. Both tokens resolve
+  // at every request, and the Socket Mode connection belongs to the one call that needs events
+  // (`watch_messages`, `ask`) for exactly as long as that call runs. So there is no session to rebuild
+  // and no scope below this to supervise: nothing in this program points into the sidecar's process, a
+  // runtime restart costs the interrupted call, and the crash policy forks the dead fiber again. What
+  // that buys is everything below staying put across a restart — above all the desk, whose collected
+  // entries are run state nothing rebuilds.
   use slack.provider(
     bot_source = credentials.env(key = "SLACK_BOT_TOKEN"),
     app_source = credentials.env(key = "SLACK_APP_TOKEN"),
@@ -532,13 +521,14 @@ agent main() -> string with io | store.get | store.set {
     request window_started(date: string, prompt_ts: string) {
       match (window) {
         case idle(_) -> { next null with { window = collecting(date = date, prompt_ts = prompt_ts, entries = []) } }
-        // Opening a window while one is already open cannot happen as the fibers run today — the schedule
-        // fiber closes every window it opens, and a rebuilt session starts this desk over. These two arms
-        // are the state machine's TOTALITY rather than expected traffic, and they are worth keeping split
-        // because each protects a different thing the other would lose.
+        // Opening a window while one is already open is exactly what a restart produces: this desk is run
+        // state and survives it, while the schedule fiber is forked again and re-opens today's recorded
+        // window. So the same-window arm below is what keeps the morning's replies — and the two arms stay
+        // split because each protects a different thing the other would lose.
         case collecting(date => open_date, prompt_ts => open_ts, entries => entries) -> {
           if (open_date == date && open_ts == prompt_ts) {
-            // The same window: keep what was collected, so a re-open can never discard entries.
+            // The same window: keep what was collected, so a re-open — a redelivered tick, or a fiber
+            // forked again after a restart — can never discard entries.
             next null
           } else {
             // A different window: replace, so one instance's leftovers can never leak into another
@@ -558,24 +548,33 @@ agent main() -> string with io | store.get | store.set {
     }
   }
   let nursery: region.nursery[scribe_scope, fiber_ceiling] = use region.provide[scribe_scope, fiber_ceiling]
+  // The two fiber names, spelled once: the forks tag by them and the crash policy reads them back to
+  // choose which task to fork again.
+  let watcher_name = "channel-watcher"
+  let schedule_name = "standup-schedule"
   use handler {
     request region.crashed(id: string, name: string, message: string) {
-      // A fiber panic is an external call interrupted under the at-most-once rule — after a runtime
-      // restart, every call this program makes, because the connection behind them is gone. Re-forking
-      // the fiber ALONE would hand the replacement the same dead handle and it would die the same way,
-      // so the whole session replays instead: one restart mechanism, with the reconnect inside it.
-      // Nothing is posted from here, because the connection that would carry the notice is precisely
-      // what failed; the crash and each attempt are in the run's events.
-      replay.interrupted(failure = f"fiber ${name} crashed: ${message}")
+      // A fiber panic is an external call interrupted under the at-most-once rule, which after a runtime
+      // restart is whichever Slack call this fiber was holding. FORK THE TASK AGAIN and it works: the
+      // tokens are the whole of what a call needs, so the replacement resolves them and opens its own
+      // connection, with nothing stale to inherit. The window itself is in the store, so a forked-again
+      // schedule fiber resumes today's window before arming its watch. Nothing is posted from here —
+      // the crash and its replacement are in the run's events, where a loop is visible.
+      let _replacement = if (name == schedule_name) {
+        region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = schedule_name)
+      } else {
+        region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = watcher_name)
+      }
+      next null
     }
     request region.failed(id: string, name: string, error: unknown) {
-      // Only failures the occurrence guard refuses to fold reach here — auth, configuration drift.
-      // Nothing about those self-heals, so stop the run loudly rather than keep a resident that
-      // looks alive and does nothing.
+      // Only failures the occurrence guard refuses to fold reach here — auth, configuration drift, a
+      // Slack refusal to open the socket. Nothing about those self-heals, so stop the run loudly rather
+      // than keep a resident that looks alive and does nothing.
       prelude.throw(error = fiber_failure(name = name, detail = json.stringify(value = error)))
     }
   }
-  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = "channel-watcher")
-  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = "standup-schedule")
+  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = watcher_name)
+  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = schedule_name)
   region.watch(nursery = nursery)
 }

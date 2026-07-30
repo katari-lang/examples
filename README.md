@@ -18,18 +18,19 @@ the tutorial ends, and each README says which guides it puts to work.
 
 All four are **residents**: long-running programs that stay on a channel or a schedule rather than
 running once and exiting. So all four also answer the question a resident cannot avoid — what happens
-when the runtime restarts under it. A chat gateway lives in a sidecar process, so a recovered run holds
-a connection handle that is gone; each example supervises its session and reconnects, and each README
-says plainly what survives the rebuild (store state) and what does not (a conversation, a half-filled
-window, an open question). That pattern is
-[Surviving a runtime restart](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars) and the rule
-behind it is in [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution).
+when the runtime restarts under it. Every package call here carries the credential it acts with, never
+a handle into a sidecar's memory, so a restart costs exactly the **one call it interrupted**: the
+recovery is a single `region.crashed` clause that forks the dead watcher again, with no supervision
+scope and no reconnect to arrange. Each README says plainly what comes through (store state, a desk's
+conversation, a half-collected window) and what the interruption costs (the messages nobody was
+listening for, an open question). The rule is
+[What may cross the boundary](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars) and the mechanism
+under it is in [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution).
 
 Reading order: `release-watch` (no model, the durable skeleton alone) → `standup-scribe` or
-`concierge` (one model desk each) → `inbox-butler` (multi-provider composition). The flagship
-multi-agent resident beyond these is
-[tsukasa](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot), the tutorial's closing
-chapter's subject.
+`concierge` (one model desk each) → `inbox-butler` (multi-provider composition). `concierge` is
+where the [tutorial](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) sends you after its
+last chapter, so it is the shortest step up from there.
 
 ## Running an example
 

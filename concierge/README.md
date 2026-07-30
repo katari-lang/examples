@@ -29,9 +29,9 @@ time. What the face knows is exactly what was published — nothing else crosses
   [Store](https://katari-lang.dev/docs/v0.1/guides/store) and the
   [memory reference](https://katari-lang.dev/packages/memory).
 - **Durable execution, and what a restart really costs** — the face's conversation is run state
-  (a handler `var`); the notes are store state that outlives every run. A resident whose source
-  is an FFI sidecar also needs the restart loop below — `replay.forever` plus a panic converter,
-  providers inside the loop so every attempt reconnects:
+  (a handler `var`) and **survives a runtime restart**, because nothing here is rebuilt: the
+  recovery is one `region.crashed` clause that forks the dead watch again. That is what an FFI
+  package looks like when its calls carry the credential instead of a connection handle:
   [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution) and
   [FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars).
 
@@ -149,37 +149,34 @@ packages on the bus.
   `dropped` value and is reported to the owner; a dropped note *to* the owner is let go, because
   the control channel is where a report of it would have gone. Only non-recoverable failures — a
   bad token, a missing secret — stop the run, loudly.
-- **The restart loop** is what makes it a resident on this runtime. A gateway client lives in the
-  `discord` sidecar's process, not in the durable log, so a **runtime restart** leaves the run
-  holding a handle to a connection that no longer exists: the interrupted `watch_messages` comes
-  back as a panic and any later post through that handle would panic too. So the session runs
-  inside `replay.forever`, with both providers *inside* the loop — each attempt logs in again —
-  and two ways in: a `panic` converter for the session's own path, and the `region.crashed`
-  policy, which is where a dead watcher arrives (the runtime turns a fiber's panic into that
-  event rather than unwinding the watch, so the converter never sees it). A crashed *watcher*
-  rebuilds the session; a crashed one-shot mail is one lost flag and nothing more. The fatal
-  guard sits *outside* the loop, so a revoked token still stops the run instead of being retried
-  every minute. This is the shape the
-  [FFI sidecars guide](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars#survive-a-runtime-restart)
-  prescribes.
+- **The crash policy** is what makes it a resident on this runtime, and it is one clause. Nothing
+  here holds a connection: `discord.provider` serves the bot **token**, resolved per call, and a
+  call that needs the gateway (`watch_messages`) opens one for its own lifetime. So a **runtime
+  restart** costs exactly the call it interrupted — the watch — which arrives as `region.crashed`,
+  and the policy **forks the same watch again**: the fresh call resolves the token and opens its
+  own gateway. A crashed one-shot mail is one lost flag and nothing more (the asker was already
+  told the face does not know). `region.failed` is the other half: an escaped throw — a revoked
+  token, a channel the bot lost access to — leaves that source down and says so in the control
+  channel, because no fresh fork fixes a dead credential. This is the shape the
+  [FFI sidecars guide](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars#what-a-restart-costs-and-what-a-re-fork-gets-back)
+  prescribes: **`crashed` = fork it again, `failed` = stop loudly.** There is no replay scope and
+  no panic converter, because there is nothing to rebuild.
 
 Honesty notes:
 
 - **Messages can be missed.** Discord's gateway has no per-event acknowledgement, so across a
   reconnect or a runtime restart a channel message can be missed (and, rarely, repeated) — the
-  concierge does not reconcile against channel history.
-- **A rebuild costs the conversation, never the notes.** Everything inside the restart loop is
-  re-run per attempt: a fresh gateway login, a fresh nursery, fresh watchers — and the face's
-  `ai.desk` var starts empty, so the chat history (and anything filed in its backlog) is gone
-  after a rebuild. It cannot be hoisted above the loop: the desk's turn performs `ai.infer_step`
-  and its replies perform `discord.connection`, and a handler body only reaches handlers
-  installed above it, so a desk above the providers would send its model calls to the run root
-  instead of to Anthropic. The **published notes are untouched** — they live in the durable
-  store, which no attempt re-runs and no crash edits, so the membrane's data survives every
-  rebuild. Nothing is re-posted on a rebuild either, because the session posts nothing at boot;
-  the first rebuild after a runtime restart is therefore silent (the crash note cannot go out
-  through the dead handle), while a *repeating* rebuild is visible as one crash line per attempt
-  in the control channel.
+  concierge does not reconcile against channel history. The gap around a restart is the seconds
+  between the interrupted watch and its replacement: nothing was listening, so nothing arrived.
+- **A restart costs the gap, and nothing else — the conversation survives it.** The face's
+  `ai.desk` var is run state, and a recovered run resumes from committed state: since no scope
+  here is rebuilt, the chat history and anything filed in its backlog are still there, and the
+  next question continues the same conversation. (Under the old `replay.forever` shape this was
+  not true — every attempt rebuilt the desk empty. The rule that removed the loop gave the
+  conversation back.) The **published notes** were never at risk either way: they live in the
+  durable store, which no crash edits. The one thing a restart does take is whichever call was in
+  flight, and each crash is one line in the control channel — so a *repeating* crash is visible
+  there as a repeating line rather than as silence.
 - **Nothing escalates to a human.** `katari check` reports the run's only unhandled requests as
   the store's four operations and `io`, which the runtime answers itself — so the concierge never
   parks waiting for an answer.

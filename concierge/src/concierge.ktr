@@ -36,9 +36,9 @@ request flag_question(@"The question to flag." question: string) -> string
 @"The region's scope marker: one nullary phantom per nursery."
 effect concierge_scope
 
-// Everything a fiber of the one nursery may raise: the desks' inboxes, the flag mail, the
-// gateway connection the watchers listen through, and io.
-type concierge_ceiling = face_message | control_message | question_flagged | discord.connection | io
+// Everything a fiber of the one nursery may raise: the desks' inboxes, the flag mail, the bot token
+// the watchers listen with, and io.
+type concierge_ceiling = face_message | control_message | question_flagged | discord.credential | io
 
 // Everything the composition root anticipates being thrown at it: a tool set holding two tools
 // of one name, a gateway/API failure, and the two credential-resolution failures. A model STEP
@@ -152,8 +152,8 @@ agent help_text() -> string {
 
 // ── the sources: the two channels, arriving as escalations ────────────────────────────────────────
 
-// The watchers' names, spelled once: the forks tag by them and the crash policy reads them to tell
-// a dead watcher from a dead one-shot.
+// The watchers' names, spelled once: the forks tag by them, and the crash policy reads them back to
+// tell which watch to fork again — or that the dead fiber was a one-shot with nothing to replace.
 agent face_watcher_name() -> string {
   "face-watcher"
 }
@@ -162,22 +162,26 @@ agent control_watcher_name() -> string {
   "control-watcher"
 }
 
-@"A dead fiber the session cannot replace on its own: its channel stays deaf until a fresh gateway
-login exists, so the whole session is rebuilt."
-data rebuild_session()
+@"The public channel is deaf until something listens again: fork the face watch."
+data refork_face()
 
-@"A dead fiber that was one errand: there is nothing to rebuild and the session keeps serving."
+@"The control channel is deaf until something listens again: fork the control watch."
+data refork_control()
+
+@"A dead fiber that was one errand: there is nothing to fork again and the session keeps serving."
 data lost_one_shot()
 
 // What the death of one fiber costs the session. (Type synonyms take no docs.)
-type crash_verdict = rebuild_session | lost_one_shot
+type crash_verdict = refork_face | refork_control | lost_one_shot
 
-@"What the death of the fiber named @name@ means: a watcher cannot be re-armed on a gateway handle
-a runtime restart may have killed, so it rebuilds; every other fiber here is a one-shot mail. The
-ONE name comparison, minted as the sum the crash policy dispatches on."
+@"What the death of the fiber named @name@ means: a watcher is REPLACEABLE — the bot token is the whole
+of what a watch needs, so a fresh fork opens its own gateway and serves the same channel — while every
+other fiber here is a one-shot mail. The ONE name comparison, minted as the sum the policy dispatches on."
 agent crash_verdict_of(name: string) -> crash_verdict {
-  if (name == face_watcher_name() || name == control_watcher_name()) {
-    rebuild_session()
+  if (name == face_watcher_name()) {
+    refork_face()
+  } else if (name == control_watcher_name()) {
+    refork_control()
   } else {
     lost_one_shot()
   }
@@ -189,7 +193,7 @@ there is no single stream here to route. The speaker's snowflake is tagged befor
 program (`discord.author_tag`, an HMAC under the bot token): the full tag rides `author` for
 abuse attribution, a short slice rides the content so the model can tell speakers apart, and
 the display name is framed as what it is — self-chosen, for address, never for trust."
-agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[env.missing_secret | oauth.server_error] {
+agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error] {
   agent deliver(value: discord.message) -> null with face_message | io | prelude.throw[env.missing_secret | oauth.server_error] {
     let hashed = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = value.author, length = 64)
     let tag = string.slice(value = hashed, start = 0, end = 8)
@@ -204,8 +208,9 @@ agent face_source(input: string) -> never with concierge_ceiling | prelude.throw
 
 @"The CONTROL-channel source: the owner's private channel, served forever. The raw line is all
 the desk needs — no model reads it and no identity leaves the program, so nothing is tagged
-here; the channel's MEMBERSHIP is the trust boundary."
-agent control_source(input: string) -> never with concierge_ceiling {
+here; the channel's MEMBERSHIP is the trust boundary. Opening the gateway is the watch's own job, so
+a Discord failure to open it is a throw from here — `region.failed`, not a crash to fork again."
+agent control_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error] {
   agent deliver(value: discord.message) -> null with control_message {
     control_message(text = value.text)
   }
@@ -214,29 +219,23 @@ agent control_source(input: string) -> never with concierge_ceiling {
 
 // ── the composition root ──────────────────────────────────────────────────────────────────────────
 
-@"One resident session: the fatal guard, the restart loop, the two providers, the one shared
-workspace, the nursery, the flag bridge, the two desks, the crash policy, the two watchers — then
-pump the bus forever. It returns only through the fatal guard, so the returned string is the stop
-report."
+@"One resident session: the fatal guard, the two providers, the one shared workspace, the nursery,
+the flag bridge, the two desks, the crash policy, the two watchers — then pump the bus forever. It
+returns only through the fatal guard, so the returned string is the stop report."
 agent serve(public_channel: string, control_channel: string) -> string {
-  // THE FATAL GUARD, outermost and deliberately OUTSIDE the restart loop below: a revoked token or
-  // a missing secret answers the same however often it is retried, so every anticipated throw ends
-  // the run LOUDLY. Absorbing — or endlessly retrying — an auth-shaped failure would leave a bot
-  // that looks alive and answers nothing.
+  // THE FATAL GUARD, outermost: a revoked token or a missing secret answers the same however often it
+  // is retried, so every anticipated throw ends the run LOUDLY. Absorbing an auth-shaped failure
+  // would leave a bot that looks alive and answers nothing. The panic clause keeps the stop report
+  // TOTAL: a panic this far up is a Discord call the runtime interrupted on a DESK's path (a fiber's
+  // is `region.crashed` below, and forked again), which stops the run readably.
   use handler {
     request prelude.throw(error: app_error) -> never { break f"stopped: ${json.stringify(value = error)}" }
   }
-  // THE RESTART LOOP, because a gateway client lives in the sidecar PROCESS and not in the durable
-  // log: a RUNTIME restart replays a handle that process no longer knows, so the interrupted
-  // `watch_messages` comes back as a panic and every later post through that handle panics too.
-  // Both providers sit INSIDE this loop, so each attempt logs in again with a live handle — the
-  // ffi-sidecars guide's shape. The converter catches a panic on the SESSION's own path; a panic
-  // inside a FIBER never reaches it (the runtime turns that one into `region.crashed` rather than
-  // unwinding the watch), so the crash policy signals its own rebuild.
-  use replay.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 60000.0)
-  use handler {
-    request panic(msg: string) -> never { replay.interrupted(failure = msg) }
-  }
+  use handler { request panic(msg: string) { break f"stopped on a defect or an interrupted call: ${msg}" } }
+  // NEITHER PROVIDER CONNECTS ANYTHING — `discord.provider` serves the bot token, resolved per call,
+  // and a call that needs the gateway opens one for its own lifetime. So nothing installed below can
+  // be invalidated by a runtime restart: it all stays put across one, INCLUDING the face desk's
+  // conversation, and an interrupted watch is forked again by the crash policy near the bottom.
   use anthropic.provider(source = credentials.env(key = "ANTHROPIC_API_KEY"), system = face_persona())
   use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
   // THE ONE WORKSPACE — place and serial domain in one install, and the sharing is the
@@ -291,9 +290,9 @@ agent serve(public_channel: string, control_channel: string) -> string {
     }
   }
 
-  // THE FACE DESK — one sequential handler, one `ai.desk` var: the conversation is run state,
-  // rebuilt by replay after a restart. `model_down` makes outage notices TRANSITION-only, so a
-  // dead provider costs the channels one line each, not one per message.
+  // THE FACE DESK — one sequential handler, one `ai.desk` var: the conversation is run state, and
+  // nothing above it is rebuilt, so it SURVIVES a runtime restart. `model_down` makes outage notices
+  // TRANSITION-only, so a dead provider costs the channels one line each, not one per message.
   use handler (var face: ai.desk = ai.new_desk(), var model_down: boolean = false) {
     request face_message(content: string, files: array[file], author: string) {
       let advanced = ai.advance_desk(
@@ -392,19 +391,18 @@ agent serve(public_channel: string, control_channel: string) -> string {
     }
   }
 
-  // WHAT A FIBER'S DEATH MEANS. `crashed` is a defect (a panic), and for a WATCHER the likeliest
-  // cause is the runtime restarting under it: the gateway handle the run replayed is dead, so
-  // re-forking would only re-arm a connection that no longer exists. A dead watcher therefore
-  // REBUILDS the session through the restart loop above — one fresh login, both channels listening
-  // again — and the note goes out first, so a rebuild LOOP is visible in the control channel (on
-  // the restart path that note cannot land, and that attempt is silent by necessity). `failed` is
-  // an escaped throw, and the only throws a fiber here can raise are credential-shaped
-  // (`author_tag`'s resolution): non-self-healing, so no rebuild — that source stays down.
+  // WHAT A FIBER'S DEATH MEANS. `crashed` is a panic, and for a WATCHER the likeliest cause is the
+  // runtime restarting under it — which interrupts the watch call and costs nothing else, so the answer
+  // is to FORK THE SAME WATCH AGAIN: the token is all it needs and the fresh call opens its own gateway.
+  // Nothing else here is disturbed, so the desks keep their state and only what was posted while nobody
+  // listened is lost. `failed` is an escaped throw — a Discord failure the watch raised, or `author_tag`'s
+  // credential resolution — and none self-heal, so that source stays down and says so in the channel.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
       operator_note(text = f"(fiber ${name} crashed: ${message})")
       match (crash_verdict_of(name = name)) {
-        case rebuild_session(_) -> { replay.interrupted(failure = f"the ${name} fiber crashed: ${message}") }
+        case refork_face(_) -> { let _face = region.fork(nursery = nursery, task = face_source, argument = public_channel, name = face_watcher_name()); next null }
+        case refork_control(_) -> { let _control = region.fork(nursery = nursery, task = control_source, argument = control_channel, name = control_watcher_name()); next null }
         // A dead flag mail is one lost flag; the face already told the asker it does not know, so
         // nothing else depends on it and the session keeps serving.
         case lost_one_shot(_) -> { next null }

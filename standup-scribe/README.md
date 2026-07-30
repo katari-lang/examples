@@ -4,9 +4,9 @@ A Slack standup scribe. Every weekday at a configured hour it posts the standup 
 channel; teammates reply in the prompt's thread; when the window closes, one model step drafts a
 compact digest and the **facilitator reviews it before it posts** — press *Post it*, rewrite it in
 an editable form, or *Discard*. Nothing model-written reaches the channel without a human click,
-and what the facilitator submits is exactly what posts. The scribe reconnects to Slack by itself after
-a runtime restart and picks the day's open window back up — losing the replies collected before the
-restart, which is spelled out under [Durability, honestly](#durability-honestly).
+and what the facilitator submits is exactly what posts. A runtime restart costs the scribe the one
+call it interrupted: the day's open window, and the replies already collected in it, both come
+through — spelled out under [Durability, honestly](#durability-honestly).
 
 ## What this example teaches
 
@@ -29,12 +29,12 @@ restart, which is spelled out under [Durability, honestly](#durability-honestly)
   occurrence becomes one facilitator line, and only auth failures stop the run — loudly:
   [Handler geometry](https://katari-lang.dev/docs/v0.1/guides/handler-geometry).
 - **A desk and its region**: a sequential handler as the collection actor, fibers as sources, and a
-  crash policy that rebuilds the session rather than inventing an answer:
+  crash policy that forks a dead fiber again rather than inventing an answer:
   [A second agent](https://katari-lang.dev/docs/v0.1/guides/second-agent),
   [A Discord bot](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) (the resident shape).
-- **Surviving a runtime restart with a sidecar**: a Slack client handle lives in the sidecar process,
-  so a recovered run holds a dead one. The whole session sits in a `replay.forever` scope with a panic
-  converter, which is the one composition that reconnects:
+- **Surviving a runtime restart with a sidecar**: every Slack call carries the tokens it acts with, so
+  a restart costs the interrupted call and nothing else — no session to rebuild, no replay scope, and
+  the desk's collected replies stay put:
   [FFI sidecars](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars).
 
 ## Setup
@@ -133,8 +133,8 @@ Everything is in [`src/standup_scribe.ktr`](src/standup_scribe.ktr), top to bott
   `{ prompt_ts, close_at }` — the thread entries hang under, and the instant collection ends — so one
   reader (`read_marker`) answers `recorded_window | no_window | unreadable_marker` and every path
   dispatches on that. It is what makes three different situations one mechanism: a redelivered tick
-  re-opens the same window, a rebuilt session resumes it before arming its watch, and a window whose
-  close has passed is left alone.
+  re-opens the same window, a schedule fiber forked again after a crash resumes it before arming its
+  watch, and a window whose close has passed is left alone.
 - **One sequential desk** (`main`'s `var window` handler) is the collection actor: `idle` or
   `collecting(date, prompt_ts, entries)`. Only replies **threaded under the day's prompt** are
   collected — the `slack.message` data carries its thread's `ts`, so thread membership, not timing,
@@ -152,32 +152,36 @@ Everything is in [`src/standup_scribe.ktr`](src/standup_scribe.ktr), top to bott
   stays armed; auth failures and configuration drift re-raise, the fiber's death reaches the
   region's `failed` policy, and the run stops loudly. A `try_send` that drops the approved digest
   reports the approved text to the facilitator so it can be posted by hand.
-- **The session is a replay scope.** `slack.provider`, the desk, the region and its policies all sit
-  inside `replay.forever`, under a converter that turns a panic — and a refused connect — into a
-  replay signal. That is what makes a restart recoverable: a fiber that panicked on a dead handle
-  cannot be fixed by re-forking it, only by reconnecting, so `region.crashed` replays the session
-  instead of re-forking one fiber. `region.failed` stays outside that policy: an uncaught throw is a
-  dead token or configuration drift, and those stop the run.
+- **The crash policy is one clause per ending.** `slack.provider` connects nothing — it serves the
+  two tokens, resolved per call, and the Socket Mode connection belongs to the one call that needs
+  events. So `region.crashed` (a call the runtime interrupted) **forks the same task again**, which
+  simply works: the replacement resolves the tokens and opens its own connection. `region.failed` is
+  the opposite ending — an uncaught throw is a dead token, a Slack refusal to open the socket, or
+  configuration drift — and it stops the run. Nothing wraps any of this in a replay scope, so nothing
+  below it is ever rebuilt.
 
 ### Durability, honestly
 
 - The cron's next occurrence and the mid-window sleep are durable timers — nothing is held in
   memory, and a deadline that passed while the runtime was down fires at once.
-- **A runtime restart reconnects, and the open window survives it — the replies already collected do
-  not.** The Slack client lives in the sidecar process, not in the durable log, so a recovered run
-  holds a handle to a connection that is gone and its next Slack call panics. The session is rebuilt
-  with a fresh connection rather than run on the dead one, which re-forks both fibers. The window
-  itself is not in either fiber: the store holds its thread *and* the instant it closes, so the new
-  schedule fiber picks today's window back up and closes it on time, at the same instant the original
-  would have. What is lost is the **desk**, which is rebuilt empty — so the digest covers the replies
-  that arrive *after* the restart, and the ones collected before it are gone. Nothing pretends
-  otherwise: a digest drafted from a partial thread is one the facilitator can see and fix in the
-  Edit box.
+- **A runtime restart keeps the open window *and* the replies already collected in it.** Every Slack
+  call carries the tokens it acts with, so a restart invalidates nothing the program holds: it costs
+  the one call that was in flight. That is normally the channel watch, which arrives at
+  `region.crashed` and is forked again — a fresh Socket Mode connection, collecting again. The desk is
+  untouched, because nothing rebuilds it: its `var` is run state, and a recovered run resumes from
+  committed state. The schedule fiber is usually untouched too (a mid-window `time.sleep_until` is a
+  durable timer, not an external call), and if it *was* in a Slack call, the fork that replaces it
+  reads the store marker, re-opens the same window — the desk recognises the same
+  `(date, prompt_ts)` and **keeps its entries** — and closes it at the instant the original would
+  have. What the restart does cost is the gap: Socket Mode delivers to open sockets, so replies posted
+  while nothing was listening are not delivered at all, then or later. The digest is drawn from the
+  replies that were collected, and the facilitator can still fix it in the Edit box.
 - The tick is **at-least-once**. A redelivered occurrence does *not* repost the prompt, and does not
   re-open a window that has already closed: the per-date marker (`standup/prompts/<date>`, holding
   `{ prompt_ts, close_at }`) is the whole record of today's window. The one gap the marker cannot
-  close is a restart that interrupts the prompt's own send: the post may have reached Slack with
-  nothing committed to say so, and the re-run then posts a second prompt.
+  close is a restart that interrupts the prompt's own send — the post may have reached Slack with
+  nothing committed to say so. The forked-again fiber finds no marker and stays quiet (that day is
+  skipped); a *redelivered tick* inside the window would post a second prompt.
 - A marker row this version cannot read — one written by an older build, or hand-edited — is treated
   as "a prompt went out but its lifetime is unknown": nothing is re-posted, that day is skipped, and
   the facilitator is told which row to delete. Upgrading mid-day costs one standup, loudly, rather
@@ -185,18 +189,22 @@ Everything is in [`src/standup_scribe.ktr`](src/standup_scribe.ktr), top to bott
 - Message delivery from Slack is at-least-once too; the scribe keeps no dedup memory, so a reply
   whose acknowledgement was lost to a dropped socket can appear twice in the entries (and the
   digest's model step will see it twice).
-- An open review does **not** survive a runtime restart: the ask rides one external call, so a
-  restart voids it and its buttons go stale. Nothing invents an answer for a question nobody
-  answered, and nothing is posted — the connection that would have carried a notice is exactly what
-  died. The next weekday asks fresh.
+- An open review does **not** survive a runtime restart: the ask rides one external call, so a restart
+  voids it and its buttons go stale. Nothing invents an answer for a question nobody answered, and that
+  day's digest is not posted. The schedule fiber is forked again, finds today's window already closed,
+  and says nothing — deliberately: from the store it cannot tell a review that died from a digest that
+  posted hours ago, and the honest silence beats a line that guesses. The next weekday asks fresh.
 - A standup missed while the runtime was down is **skipped**, not backfilled, and the facilitator gets
   one line saying so. `time.watch` fires a single catch-up for an outage, and the occurrence checks the
   clock before posting: a prompt whose window has already elapsed would only litter the channel with a
   question nobody can still answer.
-- Only a failure that will not heal stops the run: an auth error or configuration drift reaches
-  `region.failed` and throws to the root, which is a stopped run somebody notices. A defect that
-  recurs on every attempt instead retries at the capped backoff (up to a minute apart) rather than
-  stopping — `katari status <run>` and its events are where you see that, not the channel.
+- Only a failure that will not heal stops the run: an auth error, configuration drift, or a Slack
+  refusal to open the socket reaches `region.failed` and throws to the root, which is a stopped run
+  somebody notices. A **panic** takes the other road and is forked again, with no backoff — so a
+  genuine defect that panics on every attempt is a fork loop rather than a stop. That is why the boot
+  validates the hour, the window and the zone: `time.cron` panics on a zone it does not know, and the
+  policy would fork the fiber straight back into it. `katari status <run>` and its events are where
+  such a loop is visible, not the channel.
 
 ## Everyday commands
 
