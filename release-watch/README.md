@@ -177,6 +177,11 @@ Failure discipline, honestly stated:
   one `fatal: ...` as the run's result, because no number of fresh forks fixes a dead credential, and a
   stopped run is a fact somebody notices. `watch_messages` raises that throw itself now: the bot token
   is checked when the gateway opens, not when the provider is installed.
+- **That fork has no backoff and no cap**, so a panic that reproduced on *every* attempt would be a
+  loop rather than a stop. Which is why `POLL_MINUTES` is clamped to at least a minute where it is
+  read: `time.interval` panics on a non-positive period, and the policy would fork the poll fiber
+  straight back into that panic. The crash policy posts nothing to the channel, so
+  `katari status <run>` and its events are where such a loop would be visible.
 - Unauthenticated GitHub allows 60 requests an hour. Keep `(60 / POLL_MINUTES) * watched
   repositories` under that, or `list` will show rate-limit failures until the window clears.
 - The GitHub API rejects any request that carries no `User-Agent`. `web.fetch_page` sets no header of
