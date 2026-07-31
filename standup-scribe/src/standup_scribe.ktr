@@ -173,7 +173,14 @@ message to the scribe desk. Collection policy lives at the desk, not here — th
 everything and stays ignorant of windows. The watch opens the Socket Mode connection for its own
 lifetime, so a token Slack refuses is a throw HERE (the region's `failed` policy stops the run on
 one), and an interrupted watch is a panic the crash policy answers by forking this task again."
-agent channel_watcher(input: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error] {
+agent channel_watcher(input: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error | supervise.panicked] {
+  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
+  // converter makes that the supervision signal and the provider opens a fresh connection after a
+  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
+  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
+  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
+  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  use supervise.signal_panics()
   agent deliver(value: slack.message) -> null with channel_message {
     channel_message(author = value.author, text = value.text, thread = value.thread)
   }
@@ -184,7 +191,14 @@ agent channel_watcher(input: string) -> never with channel_message | slack.crede
 weekday at the configured hour — open the window, wait it out, close it, and see the digest through
 review. One fiber runs all of it deliberately: `time.watch` serializes deliveries so an occurrence can
 never overlap itself, and the desk stays free to collect while this fiber sleeps or waits on a human."
-agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal] {
+agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal | supervise.panicked] {
+  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
+  // converter makes that the supervision signal and the provider opens a fresh connection after a
+  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
+  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
+  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
+  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  use supervise.signal_panics()
   @"The calendar date an instant falls on, read in the configured zone — what the marker and the digest
   are both named by. Boot validated the zone, so the null arm is configuration drift, not weather."
   agent date_of(instant: number) -> string with prelude.throw[bad_timezone] {
@@ -317,45 +331,6 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
     ),
     deliver_to = occurrence,
   )
-}
-
-// ─── what one fiber's death costs ─────────────────────────────────────────────────────────────────
-
-// The two fiber names, spelled once: the forks tag by them and the crash policy reads them back to
-// tell which task to start again.
-agent watcher_name() -> string {
-  "channel-watcher"
-}
-
-agent schedule_name() -> string {
-  "standup-schedule"
-}
-
-@"The channel watcher died: replies reach nobody until something is listening again."
-data refork_watcher()
-
-@"The schedule fiber died: no weekday is armed, and an open window has nobody left to close it."
-data refork_schedule()
-
-@"A fiber this policy holds no task for: there is nothing to fork again and the scribe keeps
-running. Unreachable while these two forks are the only ones — and here so that a third one added
-later cannot be silently answered with the wrong task."
-data lost_fiber()
-
-// What the death of one fiber costs the scribe. (Type synonyms take no docs.)
-type crash_verdict = refork_watcher | refork_schedule | lost_fiber
-
-@"What the death of the fiber named @name@ means. Both fibers are REPLACEABLE — the tokens are the
-whole of what a Slack call needs, and the day's window is in the store, so a fresh fork resolves the
-one and resumes the other. The ONE name comparison, minted as the sum the policy dispatches on."
-agent crash_verdict_of(name: string) -> crash_verdict {
-  if (name == schedule_name()) {
-    refork_schedule()
-  } else if (name == watcher_name()) {
-    refork_watcher()
-  } else {
-    lost_fiber()
-  }
 }
 
 // ─── the digest ───────────────────────────────────────────────────────────────────────────────────
@@ -587,30 +562,18 @@ agent main() -> string with io | store.get | store.set {
     }
   }
   let nursery: region.nursery[scribe_scope, fiber_ceiling] = use region.provide[scribe_scope, fiber_ceiling]
+  // Each fiber supervises ITSELF, so a panic is converted inside it and answered by its own backoff;
+  // it never reaches here. Only a budget the fiber could not keep escapes, as a throw — auth,
+  // configuration drift, a Slack refusal to open the socket — and nothing about those self-heals.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
-      // A fiber panic is an external call interrupted under the at-most-once rule, which after a runtime
-      // restart is whichever Slack call this fiber was holding. FORK THE TASK AGAIN and it works: the
-      // tokens are the whole of what a call needs, so the replacement resolves them and opens its own
-      // connection, with nothing stale to inherit. The window itself is in the store, so a forked-again
-      // schedule fiber resumes today's window before arming its watch. WHICH task is a dispatch on the
-      // verdict sum, never a fallback: a name this policy does not know gets no fork at all, so a fiber
-      // added later cannot quietly be answered with a second watcher. Nothing is posted from here —
-      // the crash and its replacement are in the run's events, where a loop is visible.
-      match (crash_verdict_of(name = name)) {
-        case refork_schedule(_) -> { let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = schedule_name()); next null }
-        case refork_watcher(_) -> { let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = watcher_name()); next null }
-        case lost_fiber(_) -> { next null }
-      }
+      next null
     }
     request region.failed(id: string, name: string, error: unknown) {
-      // Only failures the occurrence guard refuses to fold reach here — auth, configuration drift, a
-      // Slack refusal to open the socket. Nothing about those self-heals, so stop the run loudly rather
-      // than keep a resident that looks alive and does nothing.
       prelude.throw(error = fiber_failure(name = name, detail = json.stringify(value = error)))
     }
   }
-  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = watcher_name())
-  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = schedule_name())
+  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = "channel-watcher")
+  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = "standup-schedule")
   region.watch(nursery = nursery)
 }

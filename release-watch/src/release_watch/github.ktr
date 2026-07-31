@@ -51,10 +51,12 @@ agent describe_failure(error: http.api_error | http.auth_error | http.fetch_erro
   }
 }
 
-@"THE total probe: one repository's latest release as a value, never a throw. `prelude.catch`
-folds the transport's whole throw union into `probe_failed`."
+@"THE total probe: one repository's latest release as a value, never a throw. The converter turns the
+transport's whole throw union into the supervision signal and `supervise.once` hands it back — once,
+because a failed probe is the next tick's business, not this one's."
 agent probe_release(repository: commands.repository_spec) -> probe with io {
-  agent fetch_latest(value: null) -> probe with io | prelude.throw[http.api_error | http.auth_error | http.fetch_error | json.parse_error] {
+  match (supervise.once(task = agent () -> probe {
+    use supervise.signal_throws[http.api_error | http.auth_error | http.fetch_error | json.parse_error]()
     // `fetch_page`'s default budget (16000 code points) can cut a long release body MID-DOCUMENT
     // and a cut document fails to parse, so the budget is raised far past any single release
     // payload; one that still overflows folds into `probe_failed` via the parse error, which is
@@ -77,11 +79,8 @@ agent probe_release(repository: commands.repository_spec) -> probe with io {
         }
       }
     }
+  })) {
+    case supervise.ran(value => found) -> found
+    case supervise.signalled(failure => error) -> probe_failed(reason = describe_failure(error = error))
   }
-  prelude.catch(
-    task = fetch_latest,
-    recover = agent (error: http.api_error | http.auth_error | http.fetch_error | json.parse_error) -> probe with io {
-      probe_failed(reason = describe_failure(error = error))
-    },
-  )
 }

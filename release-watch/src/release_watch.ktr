@@ -35,7 +35,14 @@ data fiber_died(@"The fiber's name." name: string, @"The thrown value, rendered.
 @"The control source: serve the watch channel forever, reporting each incoming message to the
 desk. The bot's own posts are not delivered, so replying cannot loop. Opening the gateway is the watch's
 own job, so a Discord refusal is a throw from HERE and the region's `failed` policy stops the run on one."
-agent control_source(input: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error] {
+agent control_source(input: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error | supervise.panicked] {
+  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
+  // converter makes that the supervision signal and the provider opens a fresh connection after a
+  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
+  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
+  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
+  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  use supervise.signal_panics()
   agent deliver(value: discord.message) -> null with control_message {
     control_message(message = value)
   }
@@ -49,7 +56,14 @@ where a poll is cheap and order is irrelevant. `time.watch`'s timer is durable (
 the persisted next occurrence); the interval is read once at start (`POLL_MINUTES`, default 10) and
 clamped to at least a minute, since `time.interval` demands a positive period and a `0` in the env
 would otherwise take the fiber down at its first breath."
-agent poll_source(input: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
+agent poll_source(input: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error | supervise.panicked] {
+  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
+  // converter makes that the supervision signal and the provider opens a fresh connection after a
+  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
+  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
+  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
+  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  use supervise.signal_panics()
   let interval_minutes = math.max(left = env.get_integer_or(key = "POLL_MINUTES", fallback = 10), right = 1)
   agent tick(time: number) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
     let _checked = for (let row in watch_list.read_watches()) {
@@ -62,45 +76,6 @@ agent poll_source(input: string) -> never with store.shared | discord.credential
     null
   }
   time.watch(schedule = time.interval(milliseconds = interval_minutes * 60000), deliver_to = tick)
-}
-
-// ── what one fiber's death costs ──────────────────────────────────────────────────────────────────
-
-// The fiber names, spelled once: the forks tag by them and the crash policy reads them back to tell
-// which watch to start again.
-agent poll_name() -> string {
-  "poll-loop"
-}
-
-agent control_name() -> string {
-  "control-source"
-}
-
-@"The poll loop died: nothing is checking the feed until it runs again."
-data refork_poll()
-
-@"The control source died: the channel is deaf until something listens again."
-data refork_control()
-
-@"A fiber this policy holds no task for: there is nothing to fork again and the monitor keeps
-running. Unreachable while these two forks are the only ones — and here so that a third one added
-later cannot be silently answered with the wrong task."
-data lost_fiber()
-
-// What the death of one fiber costs the monitor. (Type synonyms take no docs.)
-type crash_verdict = refork_poll | refork_control | lost_fiber
-
-@"What the death of the fiber named @name@ means. Both fibers are REPLACEABLE — the bot token (and,
-for the poll loop, the durable watch list) is the whole of what each needs, so a fresh fork resolves
-it and opens its own connection. The ONE name comparison, minted as the sum the policy dispatches on."
-agent crash_verdict_of(name: string) -> crash_verdict {
-  if (name == poll_name()) {
-    refork_poll()
-  } else if (name == control_name()) {
-    refork_control()
-  } else {
-    lost_fiber()
-  }
 }
 
 // ── one repository's check ────────────────────────────────────────────────────────────────────────
@@ -274,29 +249,22 @@ agent main() -> string {
     }
   }
   let nursery: region.nursery[monitor_scope, monitor_ceiling] = use region.provide[monitor_scope, monitor_ceiling]
-  // The region's death policy, split by ENDING, because the two mean opposite things here. A fiber's
-  // PANIC is almost always the runtime having restarted under it, interrupting whatever call was in
-  // flight — so FORK THE TASK AGAIN: the replacement resolves the token afresh and its new call opens
-  // the gateway, with nothing left over from the dead one. WHICH task is a dispatch on the verdict
-  // sum, never a fallback: a name this policy does not know gets no fork at all, so a fiber added
-  // later cannot quietly be answered with a second control source. There is no backoff and no cap on
-  // that fork, so nothing an operator types may panic on every attempt — which is what the clamped
-  // `POLL_MINUTES` above is for. A fiber's escaped THROW is a fault no fresh fork heals (a revoked
-  // token, a shape that stopped parsing): both fibers already fold every failure they anticipate, so
-  // a throw that still arrives here rides to the fatal sink.
+  // WHAT A FIBER'S DEATH MEANS — and there is little left to say, because each fiber supervises
+  // ITSELF: a panic is converted inside the fiber and answered by its own backoff, so it never
+  // reaches here. Only a budget the fiber could not keep escapes, as a THROW, and a throw that got
+  // this far is a fault no fresh start heals (a revoked token, a stored shape that stopped parsing).
+  // So `failed` rides to the fatal sink, and `crashed` — which nothing here can now raise — reports
+  // rather than guesses.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
-      match (crash_verdict_of(name = name)) {
-        case refork_poll(_) -> { let _poll = region.fork(nursery = nursery, task = poll_source, argument = channel, name = poll_name()); next null }
-        case refork_control(_) -> { let _control = region.fork(nursery = nursery, task = control_source, argument = channel, name = control_name()); next null }
-        case lost_fiber(_) -> { next null }
-      }
+      let _outcome = discord.try_send(channel = channel, text = f"(fiber ${name} crashed: ${message} — nothing is started again; its own supervisor would have.)")
+      next null
     }
     request region.failed(id: string, name: string, error: unknown) {
       prelude.throw(error = fiber_died(name = name, detail = json.stringify(value = error)))
     }
   }
-  let _control = region.fork(nursery = nursery, task = control_source, argument = channel, name = control_name())
-  let _poll = region.fork(nursery = nursery, task = poll_source, argument = channel, name = poll_name())
+  let _control = region.fork(nursery = nursery, task = control_source, argument = channel, name = "control-source")
+  let _poll = region.fork(nursery = nursery, task = poll_source, argument = channel, name = "poll-loop")
   region.watch(nursery = nursery)
 }

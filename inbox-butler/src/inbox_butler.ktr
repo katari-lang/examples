@@ -259,13 +259,13 @@ agent handle_mail(message: gmail.message) -> null with spawn_gate | gmail.creden
 @"The mail source's whole body: watch the mailbox and report each arrival. Resilience is the
 converter idiom AROUND the watch: poll failures — `http.auth_error` included, the gmail package's own
 prescription, since a re-run re-resolves the token and a credential needing a human PARKS on its
-authorize escalation — become `replay.interrupted`, re-running the watch after a capped backoff.
+authorize escalation — become `supervise.interrupted`, re-running the watch after a capped backoff.
 The cursor is durable, so a restart delivers the downtime instead of skipping it."
 agent mail_source(input: null) -> null with source_ceiling {
-  use replay.forever(initial_delay_milliseconds = 5000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+  use supervise.forever(initial_delay_milliseconds = 5000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use handler {
     request prelude.throw(error: http.api_failure | http.fetch_error | json.parse_error) -> never {
-      replay.interrupted(failure = error)
+      supervise.interrupted(failure = error)
     }
   }
   agent deliver(value: gmail.message) -> null with mail_arrived {

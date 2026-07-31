@@ -140,7 +140,7 @@ One region, one desk, two kinds of fiber — all in
 
 - **The source fiber** (`mail_source`) runs `gmail.watch` with a durable cursor
   (`inbox_butler/gmail_cursor`), reporting each newly arrived mail to the desk as one
-  `mail_arrived` request. It is wrapped in `replay.forever` plus a converter handler, so a Gmail
+  `mail_arrived` request. It is wrapped in `supervise.forever` plus a converter handler, so a Gmail
   outage or an expiring token becomes a capped backoff instead of a dead watch.
 - **The desk** (a sequential `mail_arrived` handler) triages one mail at a time: a durable
   `inbox_butler/handled/<id>` marker first (the watch is at-least-once; the marker holds the model

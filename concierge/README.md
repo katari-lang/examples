@@ -183,7 +183,7 @@ Honesty notes:
 - **A restart costs the gap, and nothing else — the conversation survives it.** The face's
   `ai.desk` var is run state, and a recovered run resumes from committed state: since no scope
   here is rebuilt, the chat history and anything filed in its backlog are still there, and the
-  next question continues the same conversation. (Under the old `replay.forever` shape this was
+  next question continues the same conversation. (Under the old `supervise.forever` shape this was
   not true — every attempt rebuilt the desk empty. The rule that removed the loop gave the
   conversation back.) The **published notes** were never at risk either way: they live in the
   durable store, which no crash edits. The one thing a restart does take is whichever call was in

@@ -78,18 +78,6 @@ agent flag_unknown(@"The question you could not answer, in the asker's words." q
   flag_question(question = question)
 }
 
-@"The turn ran, and settled on whatever `ai.advance_desk` settled on."
-data turn_taken(@"The advanced desk and its outcome." turn: ai.desk_turn)
-
-@"The runtime INTERRUPTED this turn's call — the at-most-once rule, which after a restart is whichever
-provider or Discord call the turn was holding. A VALUE rather than the panic it arrives as, because the
-CONVERSATION is worth more than the arrival: the desk keeps what its last completed turn committed, and
-the cost is one message that went unanswered."
-data turn_interrupted(@"The panic message the interrupted call died with." message: string)
-
-// How one face turn ended, including the ending a turn cannot report itself. (Type synonyms take no docs.)
-type turn_ending = turn_taken | turn_interrupted
-
 // ── the control protocol: strings at the boundary, a sum everywhere after it ──────────────────────
 
 @"Publish (or overwrite) the note under @key@ — the face answers from it on its next turn."
@@ -198,48 +186,21 @@ agent help_text() -> string {
 
 // ── the sources: the two channels, arriving as escalations ────────────────────────────────────────
 
-// The watchers' names, spelled once: the forks tag by them, and the crash policy reads them back to
-// tell which watch to fork again — or that the dead fiber was a one-shot with nothing to replace.
-agent face_watcher_name() -> string {
-  "face-watcher"
-}
-
-agent control_watcher_name() -> string {
-  "control-watcher"
-}
-
-@"The public channel is deaf until something listens again: fork the face watch."
-data refork_face()
-
-@"The control channel is deaf until something listens again: fork the control watch."
-data refork_control()
-
-@"A dead fiber that was one errand: there is nothing to fork again and the session keeps serving."
-data lost_one_shot()
-
-// What the death of one fiber costs the session. (Type synonyms take no docs.)
-type crash_verdict = refork_face | refork_control | lost_one_shot
-
-@"What the death of the fiber named @name@ means: a watcher is REPLACEABLE — the bot token is the whole
-of what a watch needs, so a fresh fork opens its own gateway and serves the same channel — while every
-other fiber here is a one-shot mail. The ONE name comparison, minted as the sum the policy dispatches on."
-agent crash_verdict_of(name: string) -> crash_verdict {
-  if (name == face_watcher_name()) {
-    refork_face()
-  } else if (name == control_watcher_name()) {
-    refork_control()
-  } else {
-    lost_one_shot()
-  }
-}
-
 @"The PUBLIC-channel source: serve the community channel forever, each message becoming face
 mail. `watch_messages` subscribes to ONE channel, so two channels are honestly two fibers —
 there is no single stream here to route. The speaker's snowflake is tagged before it leaves the
 program (`discord.author_tag`, an HMAC under the bot token): the full tag rides `author` for
 abuse attribution, a short slice rides the content so the model can tell speakers apart, and
 the display name is framed as what it is — self-chosen, for address, never for trust."
-agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error] {
+agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error | supervise.panicked] {
+  // THE WATCH RESTARTS ITSELF. A runtime restart interrupts this call and the frame panics; the
+  // converter makes that the replay signal and the provider opens a fresh gateway after a backoff —
+  // the token is the whole of what a watch needs, so there is nothing stale to inherit. The boundary
+  // is INSIDE the fiber, so the desks' state, which lives above it, is not rebuilt by a re-run. Five
+  // attempts in: a restart spends one and the next succeeds, while a defect that panics every time
+  // spends the budget and throws, arriving at `region.failed` as a stop somebody notices.
+  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  use supervise.signal_panics()
   agent deliver(value: discord.message) -> null with face_message | io | prelude.throw[env.missing_secret | oauth.server_error] {
     let hashed = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = value.author, length = 64)
     let tag = string.slice(value = hashed, start = 0, end = 8)
@@ -256,7 +217,10 @@ agent face_source(input: string) -> never with concierge_ceiling | prelude.throw
 the desk needs — no model reads it and no identity leaves the program, so nothing is tagged
 here; the channel's MEMBERSHIP is the trust boundary. Opening the gateway is the watch's own job, so
 a Discord failure to open it is a throw from here — `region.failed`, not a crash to fork again."
-agent control_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error] {
+agent control_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | supervise.panicked] {
+  // As the face watch: it restarts itself, and only a budget it cannot keep reaches `region.failed`.
+  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  use supervise.signal_panics()
   agent deliver(value: discord.message) -> null with control_message {
     control_message(text = value.text)
   }
@@ -317,27 +281,6 @@ agent serve(public_channel: string, control_channel: string) -> string {
   // the persona reframes whose notes they are.
   let face_tools = [memory.recall, memory.search, memory.list_memories, flag_unknown]
 
-  // ONE TURN, GUARDED. A panic is not a throw, and the shape that lands here is the at-most-once
-  // interruption of whatever call the turn was holding when the runtime restarted under it. The root's
-  // panic clause would answer that by ending the RUN — which is right for every other path, and wrong
-  // for exactly this one: the desk's conversation is run state, so a stop costs every message ever
-  // said in the channel to pay for one arrival nobody could have answered anyway. Caught here, the
-  // desk keeps what its last completed turn committed and the loss is that one message.
-  //
-  // A genuine DEFECT inside a turn folds the same way, deliberately: it then reports one line per
-  // arrival instead of stopping, which is visible rather than silent, and the notes and the
-  // conversation both survive to be read while somebody looks at it.
-  agent guarded_turn(state: ai.desk, arrival: ai.arrival) -> turn_ending {
-    use handler { request panic(msg: string) { break turn_interrupted(message = msg) } }
-    turn_taken(turn = ai.advance_desk(
-      state = state,
-      arrival = arrival,
-      tools = face_tools,
-      persona = published_notes,
-      deliver_to = face_reply,
-    ))
-  }
-
   let nursery: region.nursery[concierge_scope, concierge_ceiling] = use region.provide[concierge_scope, concierge_ceiling]
 
   // THE FLAG BRIDGE — below the nursery because it needs the handle, above the face desk
@@ -362,18 +305,24 @@ agent serve(public_channel: string, control_channel: string) -> string {
   // TRANSITION-only, so a dead provider costs the channels one line each, not one per message.
   use handler (var face: ai.desk = ai.new_desk(), var model_down: boolean = false) {
     request face_message(content: string, files: array[file], author: string) {
-      match (guarded_turn(
-        state = face,
-        arrival = ai.arrival(source = "public-channel", content = content, hop = 0, files = files, author = author),
-      )) {
-        case turn_interrupted(message => message) -> {
+      // ONE TURN, RUN ONCE. Unlike a watch, a turn must NOT re-run: `deliver_to` may already have posted
+      // the reply, so a retry is a double post — and the desk's conversation is run state, so letting the
+      // panic reach the root would cost every message ever said in the channel to pay for one arrival
+      // nobody could have answered. Same converter as the watches, the other mechanism under it.
+      let state = face
+      let arrival = ai.arrival(source = "public-channel", content = content, hop = 0, files = files, author = author)
+      match (supervise.once(task = agent () -> ai.desk_turn {
+        use supervise.signal_panics()
+        ai.advance_desk(state = state, arrival = arrival, tools = face_tools, persona = published_notes, deliver_to = face_reply)
+      })) {
+        case supervise.signalled(failure => reason) -> {
           // Nothing about the desk was advanced, so `face` stays exactly as the last completed turn
           // left it. The asker heard nothing and nothing will retry for them — say so where somebody
           // can act on it, and keep serving.
-          operator_note(text = f"(a face turn was interrupted and is lost: ${message}. The conversation is intact; that one message went unanswered.)")
+          operator_note(text = f"(a face turn was interrupted and is lost: ${reason.message}. The conversation is intact; that one message went unanswered.)")
           next null
         }
-        case turn_taken(turn => advanced) -> {
+        case supervise.ran(value => advanced) -> {
           match (advanced.outcome) {
             case ai.answered(reply => _) -> {
               // A non-blank reply already left through `face_reply`; a blank one is silence by
@@ -472,46 +421,27 @@ agent serve(public_channel: string, control_channel: string) -> string {
     }
   }
 
-  // WHAT A FIBER'S DEATH MEANS. `crashed` is a panic, and for a WATCHER the likeliest cause is the
-  // runtime restarting under it — which interrupts the watch call and costs nothing else, so the answer
-  // is to FORK THE SAME WATCH AGAIN: the token is all it needs and the fresh call opens its own gateway.
-  // Nothing else here is disturbed, so the desks keep their state and only what was posted while nobody
-  // listened is lost. There is no backoff on that fork and no cap, so a panic that reproduces on EVERY
-  // attempt is a loop — which is why nothing an operator types can reach one here: the two channel ids
-  // are strings the boot checks, and a gateway that will not open is a `discord_error` THROW, which is
-  // the clause below and stops the run. `failed` is that escaped throw — a Discord failure the watch
-  // raised, or `author_tag`'s credential resolution — and none self-heal.
-  //
-  // WHERE THIS SITS is free, which is worth saying in a stack where most positions are not. This
-  // handler's body performs nothing either desk serves; its only needs are the `nursery` it forks into
-  // and the discord provider behind `operator_note`, both installed above. So it would compile anywhere
-  // below the nursery — unlike the flag bridge, whose position is forced from both sides. It reads here
-  // because it reads next to the forks it repeats.
+  // WHAT A FIBER'S DEATH MEANS — and there is much less of it to say now that each watch restarts
+  // ITSELF. A panic inside a watch never reaches here: its own `replay` converter takes it, and only a
+  // budget it could not keep escapes, as a THROW. So `crashed` is left with the case it was always
+  // honest about — a one-shot mail, which is one lost flag and nothing more (the asker was already told
+  // the face does not know) — and `failed` is the one real decision: a fault no fresh start fixes (the
+  // token, the bot's access, a watch that panicked five times) leaves a desk standing over a channel
+  // nobody is listening to. Alive, and deaf. So the channel gets the line while it still can, and the
+  // run STOPS: a stopped run is a fact somebody notices.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
-      operator_note(text = f"(fiber ${name} crashed: ${message})")
-      match (crash_verdict_of(name = name)) {
-        case refork_face(_) -> { let _face = region.fork(nursery = nursery, task = face_source, argument = public_channel, name = face_watcher_name()); next null }
-        case refork_control(_) -> { let _control = region.fork(nursery = nursery, task = control_source, argument = control_channel, name = control_watcher_name()); next null }
-        // A dead flag mail is one lost flag; the face already told the asker it does not know, so
-        // nothing else depends on it and the session keeps serving.
-        case lost_one_shot(_) -> { next null }
-      }
+      operator_note(text = f"(fiber ${name} crashed: ${message} — it was one errand, so nothing is started again.)")
+      next null
     }
     request region.failed(id: string, name: string, error: unknown) {
-      // The OTHER ending, and the opposite answer. Both watchers throw only what no fresh fork fixes
-      // (the token, the bot's access to the channel), and a source that stays down leaves the desks
-      // standing over a channel nobody is listening to — alive, and deaf. So the control channel gets
-      // the line while it still can, and then the run STOPS: a stopped run is a fact somebody notices.
-      // A revoked token fails this post too, and then the run stops on the post's own `auth_error`
-      // instead — the same ending, named one link earlier.
-      operator_note(text = f"(fiber ${name} stopped on an error no fresh fork fixes: ${json.stringify(value = error)} — the concierge is stopping.)")
+      operator_note(text = f"(fiber ${name} stopped on an error no fresh start fixes: ${json.stringify(value = error)} — the concierge is stopping.)")
       prelude.throw(error = fiber_died(name = name, detail = json.stringify(value = error)))
     }
   }
 
-  let _face_watcher = region.fork(nursery = nursery, task = face_source, argument = public_channel, name = face_watcher_name())
-  let _control_watcher = region.fork(nursery = nursery, task = control_source, argument = control_channel, name = control_watcher_name())
+  let _face_watcher = region.fork(nursery = nursery, task = face_source, argument = public_channel, name = "face-watcher")
+  let _control_watcher = region.fork(nursery = nursery, task = control_source, argument = control_channel, name = "control-watcher")
   region.watch(nursery = nursery)
 }
 
