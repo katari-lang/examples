@@ -92,7 +92,7 @@ katari env set BUTLER_CHANNEL <channel id>     # REQUIRED — where the butler a
 katari env set BUTLER_TIMEZONE "Asia/Tokyo"    # REQUIRED — the IANA zone "tomorrow 15:00" resolves in
 katari env set CALENDAR_ID "primary"           # optional — target calendar (default "primary")
 katari env set GMAIL_QUERY "in:inbox"          # optional — the watched search (default "in:inbox")
-katari env set GMAIL_POLL_MINUTES 5            # optional — poll cadence (default 5)
+katari env set GMAIL_POLL_MINUTES 5            # optional — poll cadence (default 5, minimum 1)
 ```
 
 ### 6. Deploy and run
@@ -105,12 +105,12 @@ katari apply                                     # compiles and bundles the side
 katari run inbox_butler.main --detach
 ```
 
-A missing secret, a bad channel id or an unresolvable timezone stops the boot with one console
-line naming the fix. If the `google` credential has never been authorized, the run **parks** on an
-authorize escalation — open it in the console, log in once, and the run resumes. A clean boot posts two
-lines to your channel: `(inbox-butler online — clock Asia/Tokyo)` from the boot check, then
-`(watching your inbox)` from the resident itself. Both are posted once per run, and a runtime restart
-does not repeat them — nothing about the resident is re-run.
+A missing secret, a bad channel id, an unresolvable timezone or a poll cadence under a minute stops
+the boot with one console line naming the fix. If the `google` credential has never been authorized,
+the run **parks** on an authorize escalation — open it in the console, log in once, and the run
+resumes. A clean boot posts two lines to your channel: `(inbox-butler online — clock Asia/Tokyo)`
+from the boot check, then `(watching your inbox)` from the resident itself. Both are posted once per
+run, and a runtime restart does not repeat them — nothing about the resident is re-run.
 
 ### Try this
 
@@ -200,6 +200,12 @@ Honest fine print:
   not this case: it parks on a re-authorization prompt, as in step 4.) A **panic** on the resident's own
   path — a Discord post the runtime interrupted between the desk and the channel — ends the run the same
   visible way, as one `failed:` line, rather than being retried in silence.
+- **A source panic is forked again with no backoff**, so a defect that panics on *every* attempt is a
+  fork loop rather than a stop. That is why the boot validates the timezone and the poll cadence: a
+  cadence under a minute panics `time.interval` on every fork, and the loop would report a line to the
+  channel each time — which Discord's rate limit then starts dropping, so the channel is the first
+  thing to go quiet under exactly the failure it is meant to show. `katari status <run>` and its events
+  are the record that does not thin out.
 - Discord replies use `try_send`, and a confirmation that cannot be posted is deliberately dropped: this
   channel is the reporting surface, so a line about the channel has no second audience.
 

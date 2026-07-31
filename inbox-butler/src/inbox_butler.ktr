@@ -29,6 +29,12 @@ agent butler_timezone() -> string {
   env.get_or(key = "BUTLER_TIMEZONE", fallback = "")
 }
 
+@"How often to poll the mailbox, in minutes — the OPTIONAL env `GMAIL_POLL_MINUTES`, default 5.
+Spelled once, because `main` validates the same value the source fiber then polls on."
+agent gmail_poll_minutes() -> integer {
+  env.get_integer_or(key = "GMAIL_POLL_MINUTES", fallback = 5)
+}
+
 // ── the interaction plane: one seam every human question goes through ─────────────────────────────
 
 @"The question reached the operator and a control completed it."
@@ -267,7 +273,7 @@ agent mail_source(input: null) -> null with source_ceiling {
   }
   gmail.watch(
     query = env.get_or(key = "GMAIL_QUERY", fallback = "in:inbox"),
-    poll_interval_milliseconds = env.get_integer_or(key = "GMAIL_POLL_MINUTES", fallback = 5) * 60000,
+    poll_interval_milliseconds = gmail_poll_minutes() * 60000,
     cursor_at = poll.resume(key = "inbox_butler/gmail_cursor"),
     deliver_to = deliver,
   )
@@ -393,10 +399,11 @@ agent boot_probe() -> string with io {
 }
 
 @"Entry: run the inbox butler as a resident — refusing to start on a missing channel, an unresolvable
-timezone, a missing credential or an unpostable channel, each as one clear console line. Past the boot it
-serves until cancelled: a lost errand is one line in the channel, a runtime restart costs the one call it
-interrupted (the mail watch is forked again, and the gmail cursor is durable, so no mail is skipped), and
-only a rejected credential ends the run — one `fatal:` line, because no retry heals one.
+timezone, a poll cadence under a minute, a missing credential or an unpostable channel, each as one clear
+console line. Past the boot it serves until cancelled: a lost errand is one line in the channel, a runtime
+restart costs the one call it interrupted (the mail watch is forked again, and the gmail cursor is durable,
+so no mail is skipped), and only a rejected credential ends the run — one `fatal:` line, because no retry
+heals one.
 Run: katari run inbox_butler.main --detach"
 agent main() -> string {
   // The panic sink. A panic reaching HERE is a Discord call the runtime interrupted on the resident's OWN
@@ -416,6 +423,15 @@ agent main() -> string {
   match (time.zone_offset(epoch_milliseconds = time.now(), zone = butler_timezone())) {
     case null -> { return f"failed: BUTLER_TIMEZONE is \"${butler_timezone()}\", which the runtime cannot resolve. Set an IANA zone name — `katari env set BUTLER_TIMEZONE Asia/Tokyo` — and run again." }
     case _offset -> null
+  }
+  // A non-positive period PANICS `time.interval` inside the mail source, and the crash policy below
+  // answers a source panic by forking it again — straight back into the same panic, on every attempt,
+  // reporting a line to the channel each time. A knob an operator types is exactly where a defect
+  // that reproduces comes from, so it is refused here rather than budgeted there.
+  if (gmail_poll_minutes() < 1) {
+    return f"failed: GMAIL_POLL_MINUTES is ${string.to_string(value = gmail_poll_minutes())}, and the mail watch needs at least one minute — `katari env set GMAIL_POLL_MINUTES 5` — then run again."
+  } else {
+    null
   }
   match (preflight_credentials()) {
     case "" -> null
