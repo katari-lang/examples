@@ -12,9 +12,10 @@ time. What the face knows is exactly what was published — nothing else crosses
 - **Two desks and mail on one region bus** — one request plus one sequential handler per
   serialization domain, and agent-to-agent mail as a fiber whose whole body is one perform:
   [A second agent: desks and mail](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent).
-- **Handler geometry** — why the providers sit above the nursery, the flag bridge above the
-  face desk, and the crash policy below the desks; and failure carried back as a *value*
-  (`send_outcome`, `desk_outcome`) instead of a throw across a handler boundary:
+- **Handler geometry** — why the providers sit above the nursery and the flag bridge above the face
+  desk, and why the crash policy's own position is *free* where those two are forced (the file says
+  which is which, since the compiler only ever tells you about the forced ones); and failure carried
+  back as a *value* (`send_outcome`, `desk_outcome`) instead of a throw across a handler boundary:
   [Handler geometry](https://katari-lang.dev/docs/v0.1/guides/handler-geometry).
 - **A resident AI desk with tools** — `ai.advance_desk` advancing one durable conversation per
   arrival, with a per-turn injected notes index and a tool set assembled as data:
@@ -156,8 +157,10 @@ packages on the bus.
   and the policy **forks the same watch again**: the fresh call resolves the token and opens its
   own gateway. A crashed one-shot mail is one lost flag and nothing more (the asker was already
   told the face does not know). `region.failed` is the other half: an escaped throw — a revoked
-  token, a channel the bot lost access to — leaves that source down and says so in the control
-  channel, because no fresh fork fixes a dead credential. This is the shape the
+  token, a channel the bot lost access to — is a fault no fresh fork fixes, so it says so in the
+  control channel and then **stops the run**. Leaving that source down instead would keep both desks
+  standing over a channel nobody is listening to: a concierge that is alive and deaf, which is worse
+  than one that stopped, because a stopped run is a fact somebody notices. This is the shape the
   [FFI sidecars guide](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars#what-a-restart-costs-and-what-a-re-fork-gets-back)
   prescribes: **`crashed` = fork it again, `failed` = stop loudly.** There is no replay scope and
   no panic converter, because there is nothing to rebuild.
@@ -175,8 +178,14 @@ Honesty notes:
   not true — every attempt rebuilt the desk empty. The rule that removed the loop gave the
   conversation back.) The **published notes** were never at risk either way: they live in the
   durable store, which no crash edits. The one thing a restart does take is whichever call was in
-  flight, and each crash is one line in the control channel — so a *repeating* crash is visible
-  there as a repeating line rather than as silence.
+  flight, and each crash is one line in the control channel.
+- **A crash is forked again with no backoff and no cap**, so a panic that reproduced on *every*
+  attempt would be a loop rather than a stop. Nothing an operator can type reaches one here — the two
+  channel ids are strings the boot checks, and a gateway that will not open is a `discord_error`
+  *throw*, which is `region.failed` and stops the run. Worth knowing anyway, because the control
+  channel is the wrong place to watch for such a loop: Discord's rate limit would start dropping those
+  very lines (`try_send` folds a drop to nothing), so the channel goes quiet under exactly the failure
+  it would have to show. `katari status <run>` and its events are the record that does not thin out.
 - **Nothing escalates to a human.** `katari check` reports the run's only unhandled requests as
   the store's four operations and `io`, which the runtime answers itself — so the concierge never
   parks waiting for an answer.
