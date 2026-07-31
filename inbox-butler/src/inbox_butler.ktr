@@ -64,10 +64,13 @@ agent guarded_ask(prompt: string, controls: array[discord.control]) -> ask_outco
   })) {
     case supervise.ran(value => answer) -> asked(answer = answer)
     case supervise.signalled(failure => why) -> {
+      // The ABSORBED endings are named and the residual flies. That order is the safe one: a
+      // constructor this package grows later lands in `rest` and stops the butler, where naming
+      // the fatal one instead would have folded it into a line nobody acts on.
       match (why) {
-        case discord.auth_error(message => text) -> prelude.throw(error = discord.auth_error(message = text))
         case discord.api_error(message => text) -> not_asked(reason = f"Discord refused the question (${text})")
         case supervise.panicked(message => msg) -> not_asked(reason = f"the question never reached the operator (${msg}); an interrupted call is never re-run, so nothing was approved")
+        case rest -> prelude.throw(error = rest)
       }
     }
   }
@@ -142,10 +145,16 @@ re-raises). Fail-closed: any box this cannot read creates NOTHING and says why."
 agent create_as_submitted(values: record[string], start_fallback: string, duration_fallback: integer, subject: string, note: string) -> string with google_calendar.credential | io | prelude.throw[http.auth_error] {
   use handler {
     request prelude.throw(error: http.api_failure | http.fetch_error | json.parse_error) -> never {
-      match (error) {
-        case http.auth_error(status => status, context => context, message => text) -> { prelude.throw(error = http.auth_error(status = status, context = context, message = text)) }
-        case rest -> { break f"(creating the event FAILED: ${json.stringify(value = rest)}. The calendar was NOT changed — the mail is still in your inbox.)" }
+      // Name what is ABSORBED, let the residual fly: a `http` error added upstream then stops the
+      // butler rather than being folded into a line. Naming them also buys the operator a sentence
+      // instead of a JSON dump.
+      let why = match (error) {
+        case http.api_error(status => status, context => context, message => text) -> f"Google refused the call (${context}: ${string.to_string(value = status)} — ${text})"
+        case http.fetch_error(message => text) -> f"the network dropped (${text})"
+        case json.parse_error(message => text) -> f"Google's reply did not parse (${text})"
+        case rest -> prelude.throw(error = rest)
       }
+      break f"(creating the event FAILED: ${why}. The calendar was NOT changed — the mail is still in your inbox.)"
     }
   }
   let title = kept_text(values = values, key = "title", fallback = "")

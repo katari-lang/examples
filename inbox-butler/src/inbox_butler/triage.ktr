@@ -44,10 +44,17 @@ and absorbing it would leave a butler that looks alive and quietly triages nothi
 agent triage_mail(message: gmail.message, zone: string) -> triage_outcome with gmail.credential | ai.infer_object | io | prelude.throw[http.auth_error] {
   use handler {
     request prelude.throw(error: ai.step_error | json.validation_error) -> never {
-      match (error) {
-        case http.auth_error(status => status, context => context, message => text) -> { prelude.throw(error = http.auth_error(status = status, context = context, message = text)) }
-        case rest -> { break triage_failed(reason = json.stringify(value = rest)) }
+      // Name what is ABSORBED, let the residual fly. A step error this package grows later then
+      // stops the butler instead of being reported as one more untriaged mail.
+      let why = match (error) {
+        case ai.provider_error(source => source, message => text, transient => _, detail => _) -> f"the model provider failed (${source}: ${text})"
+        case http.api_error(status => status, context => context, message => text) -> f"an http call was refused (${context}: ${string.to_string(value = status)} — ${text})"
+        case http.fetch_error(message => text) -> f"the network dropped (${text})"
+        case json.parse_error(message => text) -> f"a reply failed to parse (${text})"
+        case json.validation_error(message => text) -> f"the reply did not fit the schema (${text})"
+        case rest -> prelude.throw(error = rest)
       }
+      break triage_failed(reason = why)
     }
   }
   let body = gmail.read_body(id = message.id)
