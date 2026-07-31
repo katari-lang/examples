@@ -263,14 +263,11 @@ agent mail_source(input: null) -> null with source_ceiling {
       supervise.interrupted(failure = error)
     }
   }
-  agent deliver(value: gmail.message) -> null with mail_arrived {
-    mail_arrived(message = value)
-  }
   gmail.watch(
     query = env.get_or(key = "GMAIL_QUERY", fallback = "in:inbox"),
     poll_interval_milliseconds = gmail_poll_minutes() * 60000,
     cursor_at = poll.resume(key = "inbox_butler/gmail_cursor"),
-    deliver_to = deliver,
+    deliver_to = agent (value: gmail.message) -> null { mail_arrived(message = value) },
   )
 }
 

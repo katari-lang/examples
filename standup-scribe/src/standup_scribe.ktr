@@ -181,10 +181,9 @@ agent channel_watcher(input: string) -> never with channel_message | slack.crede
   // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
   use supervise.signal_panics[never]()
-  agent deliver(value: slack.message) -> null with channel_message {
+  slack.watch_messages(channel = input, deliver_to = agent (value: slack.message) -> null {
     channel_message(author = value.author, text = value.text, thread = value.thread)
-  }
-  slack.watch_messages(channel = input, deliver_to = deliver)
+  })
 }
 
 @"The schedule fiber: pick up any window an earlier instance of this fiber left open, then fire every

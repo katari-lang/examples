@@ -43,10 +43,9 @@ agent control_source(input: string) -> never with control_message | discord.cred
   // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
   use supervise.signal_panics[never]()
-  agent deliver(value: discord.message) -> null with control_message {
+  discord.watch_messages(channel = input, deliver_to = agent (value: discord.message) -> null {
     control_message(message = value)
-  }
-  discord.watch_messages(channel = input, deliver_to = deliver)
+  })
 }
 
 @"The poll loop — deliberately ONE fiber over the whole desired set rather than one fiber per

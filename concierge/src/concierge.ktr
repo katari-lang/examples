@@ -221,10 +221,9 @@ agent control_source(input: string) -> never with concierge_ceiling | prelude.th
   // As the face watch: it restarts itself, and only a budget it cannot keep reaches `region.failed`.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
   use supervise.signal_panics[never]()
-  agent deliver(value: discord.message) -> null with control_message {
+  discord.watch_messages(channel = input, deliver_to = agent (value: discord.message) -> null {
     control_message(text = value.text)
-  }
-  discord.watch_messages(channel = input, deliver_to = deliver)
+  })
 }
 
 // ── the composition root ──────────────────────────────────────────────────────────────────────────
