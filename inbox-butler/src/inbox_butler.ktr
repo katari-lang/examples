@@ -57,25 +57,20 @@ and a question the runtime interrupted both become `not_asked`; `auth_error` re-
 stop the butler loudly. The `not_asked` arm cannot hide a broken connection, because there is no connection
 to break: every call carries the bot token, and the socket an ask waits on belongs to that ask alone."
 agent guarded_ask(prompt: string, controls: array[discord.control]) -> ask_outcome with discord.credential | io | prelude.throw[discord.auth_error] {
-  // A panic is not a throw, and the one shape that lands here is the at-most-once interruption of a PENDING
-  // ask — this body runs on the CONTINUATION, above every gate. Nobody answered, so `not_asked` is the honest
-  // value, and folding it keeps one unanswered dialog from ending the butler; the mail is still in the inbox
-  // and the operator is told. The NEXT ask posts and waits on its own fresh socket, so there is nothing
-  // stale left to contain.
-  use handler {
-    request panic(msg: string) {
-      break not_asked(reason = f"the question never reached the operator — the runtime restarted while it was in front of them (${msg}), and an interrupted call is never re-run, so nothing was approved")
-    }
-  }
-  use handler {
-    request prelude.throw(error: discord.discord_error) -> never {
-      match (error) {
-        case discord.api_error(message => text) -> { break not_asked(reason = f"Discord refused the question (${text})") }
-        case rest -> { prelude.throw(error = rest) }
+  match (supervise.once(task = agent () -> discord.answer {
+    use supervise.signal_panics[discord.discord_error]()
+    use supervise.signal_throws[discord.discord_error]()
+    discord.ask(channel = butler_channel(), prompt = prompt, controls = controls)
+  })) {
+    case supervise.ran(value => answer) -> asked(answer = answer)
+    case supervise.signalled(failure => why) -> {
+      match (why) {
+        case discord.auth_error(message => text) -> prelude.throw(error = discord.auth_error(message = text))
+        case discord.api_error(message => text) -> not_asked(reason = f"Discord refused the question (${text})")
+        case supervise.panicked(message => msg) -> not_asked(reason = f"the question never reached the operator (${msg}); an interrupted call is never re-run, so nothing was approved")
       }
     }
   }
-  asked(answer = discord.ask(channel = butler_channel(), prompt = prompt, controls = controls))
 }
 
 @"The operator's decision, READ: create at @values@ — the form as submitted, not the proposal."

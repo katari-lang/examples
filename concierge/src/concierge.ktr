@@ -200,7 +200,7 @@ agent face_source(input: string) -> never with concierge_ceiling | prelude.throw
   // attempts in: a restart spends one and the next succeeds, while a defect that panics every time
   // spends the budget and throws, arriving at `region.failed` as a stop somebody notices.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
-  use supervise.signal_panics()
+  use supervise.signal_panics[never]()
   agent deliver(value: discord.message) -> null with face_message | io | prelude.throw[env.missing_secret | oauth.server_error] {
     let hashed = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = value.author, length = 64)
     let tag = string.slice(value = hashed, start = 0, end = 8)
@@ -220,7 +220,7 @@ a Discord failure to open it is a throw from here — `region.failed`, not a cra
 agent control_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | supervise.panicked] {
   // As the face watch: it restarts itself, and only a budget it cannot keep reaches `region.failed`.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
-  use supervise.signal_panics()
+  use supervise.signal_panics[never]()
   agent deliver(value: discord.message) -> null with control_message {
     control_message(text = value.text)
   }
@@ -312,7 +312,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
       let state = face
       let arrival = ai.arrival(source = "public-channel", content = content, hop = 0, files = files, author = author)
       match (supervise.once(task = agent () -> ai.desk_turn {
-        use supervise.signal_panics()
+        use supervise.signal_panics[never]()
         ai.advance_desk(state = state, arrival = arrival, tools = face_tools, persona = published_notes, deliver_to = face_reply)
       })) {
         case supervise.signalled(failure => reason) -> {

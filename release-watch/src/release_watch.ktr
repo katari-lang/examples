@@ -42,7 +42,7 @@ agent control_source(input: string) -> never with control_message | discord.cred
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
   // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
-  use supervise.signal_panics()
+  use supervise.signal_panics[never]()
   agent deliver(value: discord.message) -> null with control_message {
     control_message(message = value)
   }
@@ -63,7 +63,7 @@ agent poll_source(input: string) -> never with store.shared | discord.credential
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
   // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
-  use supervise.signal_panics()
+  use supervise.signal_panics[never]()
   let interval_minutes = math.max(left = env.get_integer_or(key = "POLL_MINUTES", fallback = 10), right = 1)
   agent tick(time: number) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
     let _checked = for (let row in watch_list.read_watches()) {

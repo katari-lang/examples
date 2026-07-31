@@ -180,7 +180,7 @@ agent channel_watcher(input: string) -> never with channel_message | slack.crede
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
   // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
-  use supervise.signal_panics()
+  use supervise.signal_panics[never]()
   agent deliver(value: slack.message) -> null with channel_message {
     channel_message(author = value.author, text = value.text, thread = value.thread)
   }
@@ -198,7 +198,7 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
   // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
   use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
-  use supervise.signal_panics()
+  use supervise.signal_panics[never]()
   @"The calendar date an instant falls on, read in the configured zone — what the marker and the digest
   are both named by. Boot validated the zone, so the null arm is configuration drift, not weather."
   agent date_of(instant: number) -> string with prelude.throw[bad_timezone] {
