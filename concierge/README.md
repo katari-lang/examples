@@ -148,8 +148,17 @@ packages on the bus.
   public channel hears one polite line *once per outage*, and the owner gets one line saying
   whether it will heal on its own (`ai.classify_outage`). A dropped public reply comes back as a
   `dropped` value and is reported to the owner; a dropped note *to* the owner is let go, because
-  the control channel is where a report of it would have gone. Only non-recoverable failures — a
-  bad token, a missing secret — stop the run, loudly.
+  the control channel is where a report of it would have gone.
+- **What stops the run is a short list, and it is short on purpose.** A stop takes the face's
+  conversation with it — the `ai.desk` is run state, so it survives a *restart* but not a *stop* —
+  which makes "stop loudly" expensive here in a way it is not in the siblings. So the three failures
+  that could reach the root without meaning the bot is finished are each caught one call from where
+  they happen: an **interrupted turn** (`guarded_turn` folds the panic — the desk keeps what its last
+  completed turn committed and one message goes unanswered), an **unreadable stored note**
+  (`guarded_forget` folds `json.validation_error` — that one key is reported, every other note keeps
+  answering), and a **model step failure** (`ai.advance_desk` folds it into an outcome). What is left
+  in the fatal set — a bad token, a missing secret, a dead source fiber — all mean the bot cannot
+  speak, so a stop costs nothing that was still working.
 - **The crash policy** is what makes it a resident on this runtime, and it is one clause. Nothing
   here holds a connection: `discord.provider` serves the bot **token**, resolved per call, and a
   call that needs the gateway (`watch_messages`) opens one for its own lifetime. So a **runtime
@@ -179,6 +188,13 @@ Honesty notes:
   conversation back.) The **published notes** were never at risk either way: they live in the
   durable store, which no crash edits. The one thing a restart does take is whichever call was in
   flight, and each crash is one line in the control channel.
+
+  A restart landing while a *desk* was mid-call is the case that used to break that promise. The
+  watchers are always in a call, so they always crash and are always forked again; but a face turn
+  waiting on the model is in one too, and an interrupted call never re-runs — so the turn panicked,
+  the root's panic clause ended the run, and the whole conversation went with it to pay for one
+  message. `guarded_turn` catches that panic at the turn instead, which is the entire reason the
+  conversation survives an unlucky restart and not just a lucky one.
 - **A crash is forked again with no backoff and no cap**, so a panic that reproduced on *every*
   attempt would be a loop rather than a stop. Nothing an operator can type reaches one here — the two
   channel ids are strings the boot checks, and a gateway that will not open is a `discord_error`

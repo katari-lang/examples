@@ -46,13 +46,15 @@ it here and the run stops, rather than leaving a concierge that looks alive over
 longer hear."
 data fiber_died(@"The dead fiber's name tag." name: string, @"The thrown value, rendered." detail: string)
 
-// Everything the composition root anticipates being thrown at it: a tool set holding two tools
-// of one name, a gateway/API failure, the two credential-resolution failures, a note whose
-// stored shape no longer reads back (memory decides a retraction inside its critical section, so
-// its answer crosses a `json` boundary the control desk calls directly), and a source fiber whose
-// throw escaped. A model STEP failure never lands here — `ai.advance_desk` folds it into its
-// outcome, and the face desk reads that outcome as a value.
-type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error | json.validation_error | fiber_died
+// Everything the composition root anticipates being thrown at it — and it is a SHORT list on purpose,
+// because a stop here costs the face's conversation along with the run: a tool set holding two tools of
+// one name, a gateway/API failure, the two credential-resolution failures, and a source fiber whose
+// throw escaped. Every one of those means the bot cannot speak, so there is nothing left to protect.
+// What is deliberately NOT here: a model STEP failure (`ai.advance_desk` folds it into its outcome), an
+// interrupted turn (`guarded_turn` folds the panic), and an unreadable stored note (`guarded_forget`
+// folds the throw) — each caught one call from where it happened, because none of the three is a
+// reason to take a working concierge down.
+type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error | fiber_died
 
 // ── the face: its standing instructions, its per-turn note, its one outward tool ──────────────────
 
@@ -75,6 +77,18 @@ after calling this, still tell the asker plainly that you do not know."
 agent flag_unknown(@"The question you could not answer, in the asker's words." question: string) -> string with flag_question {
   flag_question(question = question)
 }
+
+@"The turn ran, and settled on whatever `ai.advance_desk` settled on."
+data turn_taken(@"The advanced desk and its outcome." turn: ai.desk_turn)
+
+@"The runtime INTERRUPTED this turn's call — the at-most-once rule, which after a restart is whichever
+provider or Discord call the turn was holding. A VALUE rather than the panic it arrives as, because the
+CONVERSATION is worth more than the arrival: the desk keeps what its last completed turn committed, and
+the cost is one message that went unanswered."
+data turn_interrupted(@"The panic message the interrupted call died with." message: string)
+
+// How one face turn ended, including the ending a turn cannot report itself. (Type synonyms take no docs.)
+type turn_ending = turn_taken | turn_interrupted
 
 // ── the control protocol: strings at the boundary, a sum everywhere after it ──────────────────────
 
@@ -151,6 +165,30 @@ agent parse_command(text: string) -> control_command {
       }
     }
   }
+}
+
+@"A note whose STORED shape this version no longer reads — hand-edited, or written by an older build.
+A VALUE, because one unreadable row is not a reason to take the concierge down: the owner is told which
+key to look at and every other note keeps answering. It is the one throw `memory.forget` can raise, and
+it can only reach a program that calls `forget` directly, as this desk does."
+data unreadable_note(@"The validation failure, rendered." detail: string)
+
+// How one retraction ended: memory's own two answers, plus the one the store can hand back.
+// (Type synonyms take no docs.)
+type retraction = memory.forgot | memory.was_absent | unreadable_note
+
+@"Retract @key@, TOTALLY — the desk dispatches on three arms and never on a throw. `forget` decides
+`forgot` / `was_absent` inside the critical section that does the removal, and raises
+`json.validation_error` for a row it cannot read; that last one is caught HERE, one call away from where
+it happened, rather than at the root where it would end the run and take the face's conversation with
+it."
+agent guarded_forget(key: string) -> retraction with store.exclusive {
+  use handler {
+    request prelude.throw(error: json.validation_error) -> never {
+      break unreadable_note(detail = json.stringify(value = error))
+    }
+  }
+  memory.forget(key = key)
 }
 
 @"The control protocol, as the reply to `help` and to anything unparsed."
@@ -279,6 +317,27 @@ agent serve(public_channel: string, control_channel: string) -> string {
   // the persona reframes whose notes they are.
   let face_tools = [memory.recall, memory.search, memory.list_memories, flag_unknown]
 
+  // ONE TURN, GUARDED. A panic is not a throw, and the shape that lands here is the at-most-once
+  // interruption of whatever call the turn was holding when the runtime restarted under it. The root's
+  // panic clause would answer that by ending the RUN — which is right for every other path, and wrong
+  // for exactly this one: the desk's conversation is run state, so a stop costs every message ever
+  // said in the channel to pay for one arrival nobody could have answered anyway. Caught here, the
+  // desk keeps what its last completed turn committed and the loss is that one message.
+  //
+  // A genuine DEFECT inside a turn folds the same way, deliberately: it then reports one line per
+  // arrival instead of stopping, which is visible rather than silent, and the notes and the
+  // conversation both survive to be read while somebody looks at it.
+  agent guarded_turn(state: ai.desk, arrival: ai.arrival) -> turn_ending {
+    use handler { request panic(msg: string) { break turn_interrupted(message = msg) } }
+    turn_taken(turn = ai.advance_desk(
+      state = state,
+      arrival = arrival,
+      tools = face_tools,
+      persona = published_notes,
+      deliver_to = face_reply,
+    ))
+  }
+
   let nursery: region.nursery[concierge_scope, concierge_ceiling] = use region.provide[concierge_scope, concierge_ceiling]
 
   // THE FLAG BRIDGE — below the nursery because it needs the handle, above the face desk
@@ -303,42 +362,49 @@ agent serve(public_channel: string, control_channel: string) -> string {
   // TRANSITION-only, so a dead provider costs the channels one line each, not one per message.
   use handler (var face: ai.desk = ai.new_desk(), var model_down: boolean = false) {
     request face_message(content: string, files: array[file], author: string) {
-      let advanced = ai.advance_desk(
+      match (guarded_turn(
         state = face,
         arrival = ai.arrival(source = "public-channel", content = content, hop = 0, files = files, author = author),
-        tools = face_tools,
-        persona = published_notes,
-        deliver_to = face_reply,
-      )
-      match (advanced.outcome) {
-        case ai.answered(reply => _) -> {
-          // A non-blank reply already left through `face_reply`; a blank one is silence by
-          // protocol. Coming back from an outage is worth one line to the owner — the held
-          // messages just rejoined this very turn.
-          if (model_down) { operator_note(text = "(the face's model is answering again.)") } else { null }
-          next null with { face = advanced.state, model_down = false }
+      )) {
+        case turn_interrupted(message => message) -> {
+          // Nothing about the desk was advanced, so `face` stays exactly as the last completed turn
+          // left it. The asker heard nothing and nothing will retry for them — say so where somebody
+          // can act on it, and keep serving.
+          operator_note(text = f"(a face turn was interrupted and is lost: ${message}. The conversation is intact; that one message went unanswered.)")
+          next null
         }
-        case ai.filed(held => _, dropped => _) -> {
-          // Reachable only under `ai.with_breaker`, which this program does not install. The
-          // outcome sum carries the arm, so the fold says so instead of inventing behaviour.
-          next null with { face = advanced.state }
-        }
-        case ai.step_failed(error => error) -> {
-          // The arrival is already FILED in the desk's backlog and rejoins the next turn, so the
-          // public line promises exactly that and nothing more — `ai.outage_line`'s wording is not
-          // ours to borrow, since it promises that calling has STOPPED, which is only true under a
-          // breaker this program does not install. No retry here either: the provider spent its own
-          // retry budget before this outcome existed.
-          if (model_down) {
-            null
-          } else {
-            face_reply(reply = "(I cannot think right now — your message is kept, and I will answer as soon as I can.)")
-            match (ai.classify_outage(error = error)) {
-              case ai.needs_operator(remedy => remedy) -> operator_note(text = f"(the face's model call failed and will not heal on its own: ${remedy})")
-              case ai.waits_out(_) -> operator_note(text = f"(the face's model call failed — likely transient: ${json.stringify(value = error)}. Held messages rejoin the next successful turn.)")
+        case turn_taken(turn => advanced) -> {
+          match (advanced.outcome) {
+            case ai.answered(reply => _) -> {
+              // A non-blank reply already left through `face_reply`; a blank one is silence by
+              // protocol. Coming back from an outage is worth one line to the owner — the held
+              // messages just rejoined this very turn.
+              if (model_down) { operator_note(text = "(the face's model is answering again.)") } else { null }
+              next null with { face = advanced.state, model_down = false }
+            }
+            case ai.filed(held => _, dropped => _) -> {
+              // Reachable only under `ai.with_breaker`, which this program does not install. The
+              // outcome sum carries the arm, so the fold says so instead of inventing behaviour.
+              next null with { face = advanced.state }
+            }
+            case ai.step_failed(error => error) -> {
+              // The arrival is already FILED in the desk's backlog and rejoins the next turn, so the
+              // public line promises exactly that and nothing more — `ai.outage_line`'s wording is not
+              // ours to borrow, since it promises that calling has STOPPED, which is only true under a
+              // breaker this program does not install. No retry here either: the provider spent its own
+              // retry budget before this outcome existed.
+              if (model_down) {
+                null
+              } else {
+                face_reply(reply = "(I cannot think right now — your message is kept, and I will answer as soon as I can.)")
+                match (ai.classify_outage(error = error)) {
+                  case ai.needs_operator(remedy => remedy) -> operator_note(text = f"(the face's model call failed and will not heal on its own: ${remedy})")
+                  case ai.waits_out(_) -> operator_note(text = f"(the face's model call failed — likely transient: ${json.stringify(value = error)}. Held messages rejoin the next successful turn.)")
+                }
+              }
+              next null with { face = advanced.state, model_down = true }
             }
           }
-          next null with { face = advanced.state, model_down = true }
         }
       }
     }
@@ -376,12 +442,15 @@ agent serve(public_channel: string, control_channel: string) -> string {
           // The call itself says which ending it had, so an owner who retracts a typo is never
           // told something was removed. Reading the index first would answer the same question
           // one race narrower — memory decides this inside the section that does the removal.
-          match (memory.forget(key = key)) {
+          match (guarded_forget(key = key)) {
             case memory.forgot(_) -> {
               operator_note(text = f"(retracted \"${key}\" — the face no longer knows it.)")
             }
             case memory.was_absent(_) -> {
               operator_note(text = f"(nothing is published under \"${key}\" — send `notes` to see the keys.)")
+            }
+            case unreadable_note(detail => detail) -> {
+              operator_note(text = f"(\"${key}\" is stored in a shape this version cannot read, so it was NOT retracted: ${detail}. Delete that row in the console; everything else still answers.)")
             }
           }
           next null
