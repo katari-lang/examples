@@ -35,13 +35,15 @@ data fiber_died(@"The fiber's name." name: string, @"The thrown value, rendered.
 @"The control source: serve the watch channel forever, reporting each incoming message to the
 desk. The bot's own posts are not delivered, so replying cannot loop. Opening the gateway is the watch's
 own job, so a Discord refusal is a throw from HERE and the region's `failed` policy stops the run on one."
-agent control_source(input: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error | supervise.panicked] {
+agent control_source(input: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error] {
   // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
   // converter makes that the supervision signal and the provider opens a fresh connection after a
   // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
-  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
+  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
+  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
+  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use supervise.signal_panics[never]()
   discord.watch_messages(channel = input, deliver_to = agent (value: discord.message) -> null {
     control_message(message = value)
@@ -55,13 +57,15 @@ where a poll is cheap and order is irrelevant. `time.watch`'s timer is durable (
 the persisted next occurrence); the interval is read once at start (`POLL_MINUTES`, default 10) and
 clamped to at least a minute, since `time.interval` demands a positive period and a `0` in the env
 would otherwise take the fiber down at its first breath."
-agent poll_source(input: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error | supervise.panicked] {
+agent poll_source(input: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
   // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
   // converter makes that the supervision signal and the provider opens a fresh connection after a
   // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
-  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
+  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
+  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
+  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use supervise.signal_panics[never]()
   let interval_minutes = math.max(left = env.get_integer_or(key = "POLL_MINUTES", fallback = 10), right = 1)
   agent tick(time: number) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {

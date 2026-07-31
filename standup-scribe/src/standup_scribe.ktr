@@ -173,13 +173,15 @@ message to the scribe desk. Collection policy lives at the desk, not here — th
 everything and stays ignorant of windows. The watch opens the Socket Mode connection for its own
 lifetime, so a token Slack refuses is a throw HERE (the region's `failed` policy stops the run on
 one), and an interrupted watch is a panic the crash policy answers by forking this task again."
-agent channel_watcher(input: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error | supervise.panicked] {
+agent channel_watcher(input: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error] {
   // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
   // converter makes that the supervision signal and the provider opens a fresh connection after a
   // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
-  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
+  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
+  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
+  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use supervise.signal_panics[never]()
   slack.watch_messages(channel = input, deliver_to = agent (value: slack.message) -> null {
     channel_message(author = value.author, text = value.text, thread = value.thread)
@@ -190,13 +192,15 @@ agent channel_watcher(input: string) -> never with channel_message | slack.crede
 weekday at the configured hour — open the window, wait it out, close it, and see the digest through
 review. One fiber runs all of it deliberately: `time.watch` serializes deliveries so an occurrence can
 never overlap itself, and the desk stays free to collect while this fiber sleeps or waits on a human."
-agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal | supervise.panicked] {
+agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal] {
   // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
   // converter makes that the supervision signal and the provider opens a fresh connection after a
   // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
   // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // panics on every attempt spends the budget and throws, arriving at `region.failed` as a stop.
-  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
+  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
+  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
+  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use supervise.signal_panics[never]()
   @"The calendar date an instant falls on, read in the configured zone — what the marker and the digest
   are both named by. Boot validated the zone, so the null arm is configuration drift, not weather."

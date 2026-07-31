@@ -192,14 +192,16 @@ there is no single stream here to route. The speaker's snowflake is tagged befor
 program (`discord.author_tag`, an HMAC under the bot token): the full tag rides `author` for
 abuse attribution, a short slice rides the content so the model can tell speakers apart, and
 the display name is framed as what it is — self-chosen, for address, never for trust."
-agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error | supervise.panicked] {
+agent face_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error] {
   // THE WATCH RESTARTS ITSELF. A runtime restart interrupts this call and the frame panics; the
   // converter makes that the replay signal and the provider opens a fresh gateway after a backoff —
   // the token is the whole of what a watch needs, so there is nothing stale to inherit. The boundary
   // is INSIDE the fiber, so the desks' state, which lives above it, is not rebuilt by a re-run. Five
   // attempts in: a restart spends one and the next succeeds, while a defect that panics every time
-  // spends the budget and throws, arriving at `region.failed` as a stop somebody notices.
-  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
+  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
+  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
+  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use supervise.signal_panics[never]()
   agent deliver(value: discord.message) -> null with face_message | io | prelude.throw[env.missing_secret | oauth.server_error] {
     let hashed = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = value.author, length = 64)
@@ -217,9 +219,9 @@ agent face_source(input: string) -> never with concierge_ceiling | prelude.throw
 the desk needs — no model reads it and no identity leaves the program, so nothing is tagged
 here; the channel's MEMBERSHIP is the trust boundary. Opening the gateway is the watch's own job, so
 a Discord failure to open it is a throw from here — `region.failed`, not a crash to fork again."
-agent control_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error | supervise.panicked] {
-  // As the face watch: it restarts itself, and only a budget it cannot keep reaches `region.failed`.
-  use supervise.exponential(initial_delay_milliseconds = 1000.0, factor = 2.0, max_attempts = 5.0)
+agent control_source(input: string) -> never with concierge_ceiling | prelude.throw[discord.discord_error] {
+  // As the face watch: it restarts itself, unbounded, with the delay ceiling as the only brake.
+  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
   use supervise.signal_panics[never]()
   discord.watch_messages(channel = input, deliver_to = agent (value: discord.message) -> null {
     control_message(text = value.text)
