@@ -1,7 +1,7 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-30-f55993f8"
-katari_compiler = "0.1.1"
+snapshot = "snapshot-2026-07-31-59401211"
+katari_compiler = "0.1.4"
 
 [packages.ai]
 source = "git"
@@ -12,5 +12,5 @@ sha256 = "a0f71ea43f2065bfdfee35906ff12cf490a638a4b2777f736f046f1a0c4e821a"
 [packages.slack]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-slack"
-rev = "e66a32dda516c6aa31f8d8d74e4f8689d75905f3"
-sha256 = "0157a23495889270b09844a28794bbe79865268739c6c94c8ef9e610a621e91c"
+rev = "5e91101c58fad876401f242f8d6692c26e8b408b"
+sha256 = "e7118343bffb1045bd1f2af34bf53fb64504f019de03cd1b98e62a6612148439"

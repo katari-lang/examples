@@ -1,7 +1,7 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-30-f55993f8"
-katari_compiler = "0.1.1"
+snapshot = "snapshot-2026-07-31-59401211"
+katari_compiler = "0.1.4"
 
 [packages.ai]
 source = "git"
@@ -12,23 +12,23 @@ sha256 = "a0f71ea43f2065bfdfee35906ff12cf490a638a4b2777f736f046f1a0c4e821a"
 [packages.discord]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-discord"
-rev = "9369c011121a659b39bfcc96d51a5da2519869e9"
-sha256 = "99a952ff5935ece89bf3f602c8067bef02a249be23c4f1cdab79b77e449a67db"
+rev = "3ac5f4637486699c6174e271834f28e00eabb984"
+sha256 = "9365575165ed3827a185b2780558e50ddab1fb69718b6db6fec9af64c2e94afc"
 
 [packages.gmail]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-gmail"
-rev = "f94812a503c4a49fc88bc4728202c2d6d5bce602"
-sha256 = "e548a3c3d0dd6740dc12e42bc2c865642445831767bfde9352adc9977b2bf6d6"
+rev = "7b0d30f81ad126db44683518164797dee69a0f90"
+sha256 = "fe4ba19df3dc31607dda85a7575e92f62cb35542c008a75d8b87e06b05aa3ed3"
 
 [packages.google_calendar]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-google_calendar"
-rev = "205ec90b3bcff6b3d9c61fb4cf8626532fade429"
-sha256 = "0acf9e2de224531788e568b3aa5647a06cc7d0c4bf390cee0e837a196ef964bd"
+rev = "8a2f5b5d5d9542b5c4648bfb4845c969e9818b50"
+sha256 = "22df54b68e63fdaa41563fe6a9342196ec6c1818fe2419448224f7698c5216e3"
 
 [packages.google_common]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-google_common"
-rev = "b9501d2f37e32713afe40edc61569870566b3b92"
-sha256 = "fca1432cfd857a20c4484e1fe7903b7a3f642cde8ee4194969fd8a696fd739b5"
+rev = "494b8609140ab5125c9411578afe41e82503c012"
+sha256 = "f0be6f11959abbe7dac2dbf632a56d057addfdad5cc7c5e5109746c1918904a8"

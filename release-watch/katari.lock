@@ -1,13 +1,13 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-30-f55993f8"
-katari_compiler = "0.1.1"
+snapshot = "snapshot-2026-07-31-59401211"
+katari_compiler = "0.1.4"
 
 [packages.discord]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-discord"
-rev = "9369c011121a659b39bfcc96d51a5da2519869e9"
-sha256 = "99a952ff5935ece89bf3f602c8067bef02a249be23c4f1cdab79b77e449a67db"
+rev = "3ac5f4637486699c6174e271834f28e00eabb984"
+sha256 = "9365575165ed3827a185b2780558e50ddab1fb69718b6db6fec9af64c2e94afc"
 
 [packages.fleet]
 source = "git"
