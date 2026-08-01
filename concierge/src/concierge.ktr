@@ -108,7 +108,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
   @"Where the curator speaks, and the app's reporting channel of last resort — so a dropped note here
   has nowhere better to go. That is honest to leave: the durable notes are the source of truth, so a
   lost confirmation costs a re-ask, never a fact."
-  agent operator_note(reply: string) -> null with discord.credential | io | prelude.throw[discord.auth_error] {
+  agent operator_note(reply: string) -> null {
     let bounded = string.fit(value = reply, cap = discord.limits().message_text, marker = " …(cut)")
     match (discord.try_send(channel = control_channel, text = bounded)) {
       case discord.delivered(_) -> null
@@ -118,7 +118,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
 
   @"Where the face speaks. A reply the channel never saw is reported where somebody can act, rather
   than letting the silence pass as delivery."
-  agent face_reply(reply: string) -> null with discord.credential | io | prelude.throw[discord.auth_error] {
+  agent face_reply(reply: string) -> null {
     let bounded = string.fit(value = reply, cap = discord.limits().message_text, marker = " …(cut)")
     match (discord.try_send(channel = public_channel, text = bounded)) {
       case discord.delivered(_) -> null
@@ -131,7 +131,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
   and to nobody else. The speaker's snowflake is tagged before it leaves the program: the full tag rides
   `author` for abuse attribution, a short slice rides the content so the model can tell speakers apart,
   and the display name is framed as what it is — self-chosen, for address, never for trust."
-  agent public_watcher(self: string) -> null with discord.credential | ai.mail | io | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error] {
+  agent public_watcher(self: string) -> null {
     // THE WATCH SUPERVISES ITSELF, on `supervise.forever`'s default backoff. A runtime restart interrupts
     // this call and the frame panics; the converter makes that the supervision signal and the provider
     // opens a fresh gateway after a wait — the token is the whole of what a watch needs, so there is
@@ -139,7 +139,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
     // never resets, so it would kill a watch meant to outlive every deploy.
     use supervise.forever()
     use supervise.signal_panics[never]()
-    agent post(value: discord.message) -> null with ai.mail | io | prelude.throw[env.missing_secret | oauth.server_error] {
+    agent post(value: discord.message) -> null {
       // KEYED, not hashed: a Discord snowflake is guessable, so a bare digest of one is reversible by
       // trying the values. `crypto.pseudonym` is that judgement spelled once, and rotating the bot token
       // rotates every tag — which is the erasure story.
@@ -162,11 +162,11 @@ agent serve(public_channel: string, control_channel: string) -> string {
   is all the curator needs and no identity leaves the program, so nothing is tagged here — the channel's
   MEMBERSHIP is the trust boundary. Opening the gateway is the watch's own job, so a Discord failure to
   open it is a throw from here — `region.failed`, not a crash to fork again."
-  agent control_watcher(self: string) -> null with discord.credential | ai.mail | io | prelude.throw[discord.discord_error] {
+  agent control_watcher(self: string) -> null {
     // As the public watch: it supervises itself, unbounded, with the delay ceiling as the only brake.
     use supervise.forever()
     use supervise.signal_panics[never]()
-    agent post(value: discord.message) -> null with ai.mail {
+    agent post(value: discord.message) -> null {
       let _posted = ai.mail(to = self, source = "control-channel", content = value.text, hop = 0, files = value.files)
       null
     }
@@ -180,7 +180,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
   precisely because a remedy is information for the one person who can act on it. The community's own
   copy of that news arrives separately — `serve_observations` tells the face's conversation, which
   delivers it to the public channel."
-  agent announce_outage(event: ai.breaker_event) -> null with discord.credential | io | prelude.throw[discord.auth_error] {
+  agent announce_outage(event: ai.breaker_event) -> null {
     match (event) {
       case ai.breaker_opened(kind => kind) -> operator_note(reply = ai.outage_line(kind = kind))
       case ai.breaker_closed(kind => _) -> operator_note(reply = ai.recovery_line())
@@ -190,7 +190,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
   @"The published-notes index, re-read fresh at every model step for BOTH AIs — so a note the curator
   publishes mid-conversation is visible on the face's very next turn, with no restart. It is ambient
   rather than a persona line because the notes are the one thing both agents work from."
-  agent published_notes(value: null) -> string with store.get | store.set | store.delete | store.list {
+  agent published_notes(value: null) -> string {
     memory.index_note()
   }
 
@@ -201,7 +201,7 @@ agent serve(public_channel: string, control_channel: string) -> string {
   answer the next message knowing nothing of the last hour. So the honest report is that this concierge
   has gone deaf on that channel, and the run stops at the moment that became true rather than one
   message later."
-  agent lost_ai(which: string, cause: string) -> never with discord.credential | io | prelude.throw[app_error] {
+  agent lost_ai(which: string, cause: string) -> never {
     operator_note(reply = f"(the ${which} ended — ${cause}. Its conversation is lost and its channel watcher went with it, so the concierge is stopping rather than standing deaf over that channel. The published notes are untouched.)")
     prelude.throw(error = fiber_died(name = which, detail = cause))
   }
