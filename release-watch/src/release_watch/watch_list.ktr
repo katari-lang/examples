@@ -85,7 +85,7 @@ never re-minted) and is cheaper than a lock across two domains."
 agent remove_watch(name: string) -> null with store.shared {
   fleet.forget(root = watch_list_path(), name = name)
   agent clear() -> null {
-    use store.scope(path = repositories_path())
+    use store.workspace(path = repositories_path())
     store.delete(key = name)
   }
   let _cleared = store.shared(task = clear)
@@ -99,9 +99,16 @@ agent read_watches() -> array[fleet.row[unknown]] with store.shared | prelude.th
 }
 
 @"Validate one stored spec, TOTALLY — the one callback the sweep and every row reader share, so
-they can never disagree on what parses."
+they can never disagree on what parses. `json.validate` states the mismatch by throwing; `prelude.catch`
+is what turns that into the `null` arm a total parser has to answer with."
 agent validate_watch(value: unknown) -> commands.repository_spec | null {
-  json.try_validate[commands.repository_spec](value = value)
+  agent parsed() -> commands.repository_spec with prelude.throw[json.validation_error] {
+    json.validate[commands.repository_spec](value = value)
+  }
+  match (prelude.catch(task = parsed)) {
+    case json.validation_error(message => _) -> null
+    case specification -> specification
+  }
 }
 
 @"Boot's validate-or-drop over the desired set: keep what still reads as a `repository_spec`,
@@ -132,20 +139,21 @@ hand-edited value) also answers `null` — the next check re-primes the baseline
 a corrupt observation than crashing a listing over it."
 agent read_state(name: string) -> watch_state | null with store.shared | prelude.throw[json.validation_error] {
   agent read() -> watch_state | null {
-    use store.scope(path = repositories_path())
-    match (store.get(key = name)) {
-      case store.found(value => value) -> json.try_validate[watch_state](value = value)
-      case store.absent(key => _) -> null
-    }
+    use store.workspace(path = repositories_path())
+    // `get_or` is the typed read, and its degrade IS this reader's policy: an absent cell and one
+    // this version can no longer read both answer `null`, which the next check re-primes from.
+    store.get_or[watch_state | null](key = name, fallback = null)
   }
-  store.shared_as[watch_state | null](task = read)
+  // `shared` erases its answer to `unknown` crossing the handler boundary, so the shape the task
+  // declared is restored on the way out — this module's own schema, checked once.
+  json.validate[watch_state | null](value = store.shared(task = read))
 }
 
 @"Commit one watch's working state — one whole-cell write, last write wins; the poll loop is the
 only writer and writes at most once per repository per tick."
 agent write_state(name: string, state: watch_state) -> null with store.shared {
   agent write() -> null {
-    use store.scope(path = repositories_path())
+    use store.workspace(path = repositories_path())
     store.set(key = name, value = state)
   }
   let _written = store.shared(task = write)
@@ -178,7 +186,7 @@ agent render_state(state: watch_state) -> string {
     case announced_up_to(tag => tag) -> f"cursor at ${tag}"
   }
   let outcome = match (state.outcome) {
-    case baseline_set(tag => tag) -> if (string.is_blank(value = tag)) { "baseline set; the first release published from here is announced" } else { f"baseline set at ${tag}; announcing releases published after it" }
+    case baseline_set(tag => tag) -> if (tag == "") { "baseline set; the first release published from here is announced" } else { f"baseline set at ${tag}; announcing releases published after it" }
     case no_new_release(_) -> "ok, nothing new"
     case release_announced(tag => tag) -> f"announced ${tag}"
     case announcement_dropped(tag => tag, reason => reason) -> f"found ${tag} but the announcement was dropped (${reason}); retrying next tick"

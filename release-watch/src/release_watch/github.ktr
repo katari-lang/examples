@@ -65,16 +65,18 @@ agent probe_release(repository: commands.repository_spec) -> probe with io {
     match (json.element(target = json.parse(text = body), index = 0)) {
       case null -> no_release_yet()
       case entry -> {
-        let tag = json.text_at(target = entry, key = "tag_name")
-        if (string.is_blank(value = tag)) {
+        let tag = json.text(target = json.field(target = entry, key = "tag_name"))
+        if (string.trim(value = tag) == "") {
           // A 200 whose first entry carries no tag is not a release list; say so rather than guess.
           probe_failed(reason = "GitHub answered 200 but the payload does not look like a release list")
         } else {
           latest_release(release = github_release(
             tag = tag,
-            title = json.text_at(target = entry, key = "name", fallback = tag),
-            url = json.text_at(target = entry, key = "html_url"),
-            notes = json.text_at(target = entry, key = "body"),
+            // The fallback is where a blank display name becomes the tag — `json.text`'s own
+            // parameter, so an absent field and a `null` one take the same arm.
+            title = json.text(target = json.field(target = entry, key = "name"), fallback = tag),
+            url = json.text(target = json.field(target = entry, key = "html_url")),
+            notes = json.text(target = json.field(target = entry, key = "body")),
           ))
         }
       }

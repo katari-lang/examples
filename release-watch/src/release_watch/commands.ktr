@@ -32,7 +32,7 @@ agent render_repository(repository: repository_spec) -> string {
 @"A message split into its space- or newline-separated words — the one place raw spacing is forgiven."
 agent words(text: string) -> array[string] {
   let spaced = string.replace(value = text, search = "\n", replacement = " ")
-  array.filter(target = string.split(value = spaced, separator = " "), keep = agent (value: string) -> boolean { !string.is_blank(value = value) })
+  array.filter(target = string.split(value = spaced, separator = " "), keep = agent (value: string) -> boolean { string.trim(value = value) != "" })
 }
 
 @"The word at @index@, trimmed, or empty past the end — total, so no caller branches on bounds."
@@ -50,7 +50,8 @@ agent parse_repository(text: string) -> repository_spec | null {
   let segments = string.split(value = text, separator = "/")
   let owner = word_at(parts = segments, index = 0)
   let name = word_at(parts = segments, index = 1)
-  if (array.length(target = segments) != 2 || string.is_blank(value = owner) || string.is_blank(value = name)) {
+  // `word_at` already trimmed both, so an empty string here IS a blank segment.
+  if (array.length(target = segments) != 2 || owner == "" || name == "") {
     null
   } else {
     repository_spec(owner = owner, name = name)

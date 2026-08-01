@@ -30,22 +30,39 @@ revoked token, a stored shape that stopped parsing), so it is re-raised to the f
 stops loudly. A fiber PANIC is a different ending: the crash policy forks the task again."
 data fiber_died(@"The fiber's name." name: string, @"The thrown value, rendered." detail: string)
 
+// ── configuration ─────────────────────────────────────────────────────────────────────────────────
+
+@"The channel commands and announcements both live in — the REQUIRED env `WATCH_CHANNEL`, empty when
+unset."
+agent watch_channel() -> string {
+  string.trim(value = env.get_or(key = "WATCH_CHANNEL", fallback = ""))
+}
+
+@"How often to check, in minutes — the OPTIONAL env `POLL_MINUTES`, default 10. The env plane is
+strings, so the number is parsed where it is read, and a value that is not a whole one reads as unset:
+what to do with an unparseable knob is this program's judgement, not something a reader should decide
+silently."
+agent poll_minutes() -> integer {
+  match (string.to_integer(value = string.trim(value = env.get_or(key = "POLL_MINUTES", fallback = "")))) {
+    case null -> 10
+    case minutes -> minutes
+  }
+}
+
 // ── the sources ───────────────────────────────────────────────────────────────────────────────────
 
 @"The control source: serve the watch channel forever, reporting each incoming message to the
 desk. The bot's own posts are not delivered, so replying cannot loop. Opening the gateway is the watch's
 own job, so a Discord refusal is a throw from HERE and the region's `failed` policy stops the run on one."
-agent control_source(input: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error] {
-  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
-  // converter makes that the supervision signal and the provider opens a fresh connection after a
-  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
-  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
-  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
-  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
-  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+agent control_source(channel: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error] {
+  // THE WATCH SUPERVISES ITSELF — the two lines below, on the package default backoff. A runtime
+  // restart interrupts this call and the frame panics; the converter makes that the supervision
+  // signal and the provider opens a fresh connection after a wait. The boundary is INSIDE the fiber,
+  // so state above it is not rebuilt by a re-run. `forever`, not `exponential`: a bounded budget is a
+  // LIFETIME count that never resets, so it would kill a watch meant to outlive every deploy.
+  use supervise.forever()
   use supervise.signal_panics[never]()
-  discord.watch_messages(channel = input, deliver_to = agent (value: discord.message) -> null {
+  discord.watch_messages(channel = channel, deliver_to = agent (value: discord.message) -> null {
     control_message(message = value)
   })
 }
@@ -57,23 +74,17 @@ where a poll is cheap and order is irrelevant. `time.watch`'s timer is durable (
 the persisted next occurrence); the interval is read once at start (`POLL_MINUTES`, default 10) and
 clamped to at least a minute, since `time.interval` demands a positive period and a `0` in the env
 would otherwise take the fiber down at its first breath."
-agent poll_source(input: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
-  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
-  // converter makes that the supervision signal and the provider opens a fresh connection after a
-  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
-  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
-  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
-  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
-  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+agent poll_source(channel: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
+  // THE WATCH SUPERVISES ITSELF — see `control_source` for what those two lines buy.
+  use supervise.forever()
   use supervise.signal_panics[never]()
-  let interval_minutes = math.max(left = env.get_integer_or(key = "POLL_MINUTES", fallback = 10), right = 1)
+  let interval_minutes = math.max(left = poll_minutes(), right = 1)
   agent tick(time: number) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
     let _checked = for (let row in watch_list.read_watches()) {
       next match (watch_list.validate_watch(value = row.spec)) {
         // An unreadable row is boot's to delete and `list`'s to show; a tick passes it by.
         case null -> null
-        case repository -> check_repository(channel = input, name = row.name, repository = repository)
+        case repository -> check_repository(channel = channel, name = row.name, repository = repository)
       }
     }
     null
@@ -83,12 +94,14 @@ agent poll_source(input: string) -> never with store.shared | discord.credential
 
 // ── one repository's check ────────────────────────────────────────────────────────────────────────
 
-@"One release announcement, sized for Discord. The LINK RIDES ABOVE the notes, so `fit_message`'s
-cut can only ever cost prose, never the pointer to the rest of it."
+@"One release announcement, sized for Discord. The LINK RIDES ABOVE the notes, so the cut can only
+ever cost prose, never the pointer to the rest of it. The cap is Discord's own — the package publishes
+it as data and `string.fit` does the arithmetic the marker has to be paid for out of."
 agent announcement(repository: commands.repository_spec, release: github.github_release) -> string {
-  let notes = if (string.is_blank(value = release.notes)) { "" } else { f"\n\n${string.trim(value = release.notes)}" }
-  discord.fit_message(
-    text = f"New release on ${commands.render_repository(repository = repository)}: ${release.title} (${release.tag})\n${release.url}${notes}",
+  let notes = if (string.trim(value = release.notes) == "") { "" } else { f"\n\n${string.trim(value = release.notes)}" }
+  string.fit(
+    value = f"New release on ${commands.render_repository(repository = repository)}: ${release.title} (${release.tag})\n${release.url}${notes}",
+    cap = discord.limits().message_text,
     marker = "\n… (release notes cut to fit one Discord message; the full notes are at the link above)",
   )
 }
@@ -170,7 +183,7 @@ agent serve_command(parsed: commands.command) -> string with store.shared | prel
       }
     }
     case commands.help_requested(note => note) -> {
-      if (string.is_blank(value = note)) { commands.help_text() } else { f"${note}\n${commands.help_text()}" }
+      if (note == "") { commands.help_text() } else { f"${note}\n${commands.help_text()}" }
     }
   }
 }
@@ -209,8 +222,8 @@ agent main() -> string {
   use handler {
     request prelude.throw(error: unknown) -> never { break f"fatal: ${json.stringify(value = error)}" }
   }
-  let channel = string.trim(value = env.get_or(key = "WATCH_CHANNEL", fallback = ""))
-  if (string.is_blank(value = channel)) {
+  let channel = watch_channel()
+  if (channel == "") {
     return "failed: the non-secret env WATCH_CHANNEL must be set — `katari env set WATCH_CHANNEL <channel id>`. Commands and announcements both live there."
   } else {
     null
@@ -240,8 +253,9 @@ agent main() -> string {
     request control_message(message: discord.message) {
       // Every reply is bounded here, at the desk's one send site, so a long `list` is cut with a
       // marker instead of being refused whole by Discord's cap.
-      let reply = discord.fit_message(
-        text = serve_command(parsed = commands.parse_command(text = message.text)),
+      let reply = string.fit(
+        value = serve_command(parsed = commands.parse_command(text = message.text)),
+        cap = discord.limits().message_text,
         marker = "\n… (cut to fit one Discord message)",
       )
       let _outcome = match (discord.try_send(channel = message.channel, text = reply)) {
@@ -267,7 +281,9 @@ agent main() -> string {
       prelude.throw(error = fiber_died(name = name, detail = json.stringify(value = error)))
     }
   }
-  let _control = region.fork(nursery = nursery, task = control_source, argument = channel, name = "control-source")
-  let _poll = region.fork(nursery = nursery, task = poll_source, argument = channel, name = "poll-loop")
+  // A fork's @argument@ is the task's whole parameter record, exactly as a call's arguments are — so
+  // each of these reads as the call it is a deferred version of.
+  let _control = region.fork(nursery = nursery, task = control_source, argument = { channel = channel }, name = "control-source")
+  let _poll = region.fork(nursery = nursery, task = poll_source, argument = { channel = channel }, name = "poll-loop")
   region.watch(nursery = nursery)
 }
