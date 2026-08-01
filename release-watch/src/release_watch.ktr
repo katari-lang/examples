@@ -1,132 +1,148 @@
-// release-watch: a GitHub release monitor managed from Discord. Say `watch owner/name` in the
-// control channel; a durable poll loop checks the public releases API and announces new releases
-// back in that channel. The watch list survives restarts (it IS the store), and a repository that
-// starts failing is reported by `list` without ever taking the monitor down. The shape: one region
-// bus; one sequential CONTROL DESK; one CONTROL SOURCE fiber; one POLL fiber; the desired set in
-// `fleet`; per-watch cursors in the store. See the README for the operator view.
+// release-watch: a GitHub release monitor with an AI front desk. One curator keeps the watch list
+// from a Discord channel — `watch`, `unwatch`, `list_watches` are its whole tool set — while a poll
+// fiber checks the watched repositories on a durable timer and announces releases itself.
 
+import ai
+import ai.anthropic
 import discord
-import fleet
-import release_watch.commands
 import release_watch.github
 import release_watch.watch_list
 
-// ── the bus ───────────────────────────────────────────────────────────────────────────────────────
+// ── what this program's own agents may do ─────────────────────────────────────────────────────────
 
-@"The control desk's inbox: one incoming channel message, delivered whole by the source fiber."
-request control_message(@"The message, as Discord delivered it." message: discord.message) -> null
+// The row every agent of ours runs under — the tools, the persona, the watcher, the reply — and the
+// one type argument `ai.route` and `ai.spawn` take. (Type synonyms take no docs.)
+type watch_effects =
+  discord.credential
+  | store.get | store.exclusive
+  | io | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error]
 
-@"The region's scope marker: one nullary phantom per nursery."
-effect monitor_scope
+@"A fiber's throw escaped every fold it had, or the curator or the poll fiber ended. No fresh fork
+fixes either, so the run stops rather than leaving a monitor that watches nothing."
+data fiber_died(@"The dead fiber's name tag." name: string, @"What ended it." detail: string)
 
-// The nursery's CEILING: everything any fiber of it may raise, which is what the nursery type and
-// `region.watch` are written against. Each fiber declares only the part it actually performs, so the
-// escalation report stays a true capability read. Throws are absent by the region's contract — an
-// uncaught fiber throw arrives at the watch as the typed `region.failed` event instead.
-type monitor_ceiling = control_message | store.shared | discord.credential | io
-
-@"A fiber's THROW escaped every fold it had — a fault no fresh fork and no future tick heals (a
-revoked token, a stored shape that stopped parsing), so it is re-raised to the fatal sink and the run
-stops loudly. A fiber PANIC is a different ending: the crash policy forks the task again."
-data fiber_died(@"The fiber's name." name: string, @"The thrown value, rendered." detail: string)
+// Everything the composition root anticipates stopping on. (Type synonyms take no docs.)
+type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error | fiber_died
 
 // ── configuration ─────────────────────────────────────────────────────────────────────────────────
 
-@"The channel commands and announcements both live in — the REQUIRED env `WATCH_CHANNEL`, empty when
-unset."
-agent watch_channel() -> string {
+@"The channel the curator serves and releases are announced in — the required env `WATCH_CHANNEL`."
+agent watch_channel() {
   string.trim(value = env.get_or(key = "WATCH_CHANNEL", fallback = ""))
 }
 
-@"How often to check, in minutes — the OPTIONAL env `POLL_MINUTES`, default 10. The env plane is
-strings, so the number is parsed where it is read, and a value that is not a whole one reads as unset:
-what to do with an unparseable knob is this program's judgement, not something a reader should decide
-silently."
-agent poll_minutes() -> integer {
+@"How often to check, in minutes — the optional env `POLL_MINUTES`, default 10. A value that is not
+a whole number reads as unset, which is this program's judgement to make."
+agent poll_minutes() {
   match (string.to_integer(value = string.trim(value = env.get_or(key = "POLL_MINUTES", fallback = "")))) {
     case null -> 10
     case minutes -> minutes
   }
 }
 
-// ── the sources ───────────────────────────────────────────────────────────────────────────────────
+// ── the curator: who it is, and the three things it can do ────────────────────────────────────────
 
-@"The control source: serve the watch channel forever, reporting each incoming message to the
-desk. The bot's own posts are not delivered, so replying cannot loop. Opening the gateway is the watch's
-own job, so a Discord refusal is a throw from HERE and the region's `failed` policy stops the run on one."
-agent control_source(channel: string) -> never with control_message | discord.credential | io | prelude.throw[discord.discord_error] {
-  // THE WATCH SUPERVISES ITSELF — the two lines below, on the package default backoff. A runtime
-  // restart interrupts this call and the frame panics; the converter makes that the supervision
-  // signal and the provider opens a fresh connection after a wait. The boundary is INSIDE the fiber,
-  // so state above it is not rebuilt by a re-run. `forever`, not `exponential`: a bounded budget is a
-  // LIFETIME count that never resets, so it would kill a watch meant to outlive every deploy.
+@"The curator's character, an agent rather than a string because `ai.spawn` re-reads it every step."
+agent curator_persona() -> string {
+  "You keep the watch list of a GitHub release monitor, from this Discord channel. watch(repository) starts watching one, written owner/name; unwatch(repository) stops watching one; list_watches() shows every watch with where its announce cursor stands and what its last check found. Announcements are posted by the monitor itself on its own schedule: you neither post them nor learn when they go out, so never promise to announce something yourself and never claim a release was or was not published — list_watches is the whole of what you can see. Answer in one or two short lines, saying what the tool answered. Reply with empty text to stay silent when a message needs nothing from you."
+}
+
+@"Tool: start watching a GitHub repository for new releases. Only releases published from now on are
+announced — the first check sets the baseline silently. Watching one already watched changes nothing."
+agent watch(@"The repository, written owner/name, e.g. vercel/next.js." repository: string) -> string with store.get | store.exclusive {
+  match (watch_list.read_repository(text = repository)) {
+    case null -> f"\"${repository}\" is not a repository name — write it as owner/name, e.g. vercel/next.js."
+    case found -> {
+      let subject = github.render_repository(repository = found)
+      if (watch_list.watch_exists(repository = found)) {
+        f"Already watching ${subject}."
+      } else {
+        watch_list.save_watch(repository = found)
+        f"Watching ${subject}. The first check sets the baseline: releases published from now on are announced here."
+      }
+    }
+  }
+}
+
+@"Tool: stop watching a repository. Its cursor is forgotten with it, so watching it again starts from
+a fresh baseline."
+agent unwatch(@"The repository, written owner/name." repository: string) -> string with store.get | store.exclusive {
+  match (watch_list.read_repository(text = repository)) {
+    case null -> f"\"${repository}\" is not a repository name — write it as owner/name."
+    case found -> {
+      let subject = github.render_repository(repository = found)
+      if (watch_list.watch_exists(repository = found)) {
+        watch_list.remove_watch(repository = found)
+        f"Stopped watching ${subject}."
+      } else {
+        f"Not watching ${subject} — list_watches shows what is."
+      }
+    }
+  }
+}
+
+@"Tool: every watched repository, with where its announce cursor stands and what its last check found
+— a failing check (a typo'd name, a rate limit) shows here as that watch's last outcome."
+agent list_watches() -> string with store.get {
+  let rows = watch_list.read_watches()
+  if (array.length(target = rows) == 0) {
+    "Watching nothing. `watch owner/name` starts one."
+  } else {
+    string.join(parts = for (let row in rows) { next watch_list.render_row(row = row) }, separator = "\n")
+  }
+}
+
+// ── what the curator hears, and where it speaks ────────────────────────────────────────────────────
+
+@"What the curator listens to: the watch channel, as its own source fiber; the bot's own posts are
+not delivered, so a reply cannot loop. Opening the gateway is the watch's own job, so a Discord
+refusal is a throw from here."
+agent channel_watcher(self: string) -> null with ai.mail | discord.credential | io | prelude.throw[discord.discord_error] {
   use supervise.forever()
   use supervise.signal_panics[never]()
-  discord.watch_messages(channel = channel, deliver_to = agent (value: discord.message) -> null {
-    control_message(message = value)
+  discord.watch_messages(channel = watch_channel(), deliver_to = agent (value: discord.message) {
+    let _posted = ai.mail(to = self, source = "watch-channel", content = value.text, hop = 0, files = value.files)
+    null
   })
 }
 
-@"The poll loop — deliberately ONE fiber over the whole desired set rather than one fiber per
-repository: a tick reads the CURRENT rows and checks each in turn, so `watch` / `unwatch` need no
-fork/cancel reconcile (the next tick simply sees the new set) — good enough for a release feed,
-where a poll is cheap and order is irrelevant. `time.watch`'s timer is durable (a restart re-arms
-the persisted next occurrence); the interval is read once at start (`POLL_MINUTES`, default 10) and
-clamped to at least a minute, since `time.interval` demands a positive period and a `0` in the env
-would otherwise take the fiber down at its first breath."
-agent poll_source(channel: string) -> never with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
-  // THE WATCH SUPERVISES ITSELF — see `control_source` for what those two lines buy.
-  use supervise.forever()
-  use supervise.signal_panics[never]()
-  let interval_minutes = math.max(left = poll_minutes(), right = 1)
-  agent tick(time: number) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
-    let _checked = for (let row in watch_list.read_watches()) {
-      next match (watch_list.validate_watch(value = row.spec)) {
-        // An unreadable row is boot's to delete and `list`'s to show; a tick passes it by.
-        case null -> null
-        case repository -> check_repository(channel = channel, name = row.name, repository = repository)
-      }
-    }
-    null
+@"Where the curator speaks — the channel it is addressed from, so a dropped reply has nowhere better
+to go and asking again is the retry."
+agent post_reply(reply: string) {
+  match (discord.try_send(channel = watch_channel(), text = string.fit(value = reply, cap = discord.limits().message_text, marker = "\n… (cut to fit one Discord message)"))) {
+    case discord.delivered(_) -> null
+    case discord.dropped(reason => _) -> null
   }
-  time.watch(schedule = time.interval(milliseconds = interval_minutes * 60000), deliver_to = tick)
 }
 
-// ── one repository's check ────────────────────────────────────────────────────────────────────────
+// ── the poll loop, where no model runs ────────────────────────────────────────────────────────────
 
-@"One release announcement, sized for Discord. The LINK RIDES ABOVE the notes, so the cut can only
-ever cost prose, never the pointer to the rest of it. The cap is Discord's own — the package publishes
-it as data and `string.fit` does the arithmetic the marker has to be paid for out of."
-agent announcement(repository: commands.repository_spec, release: github.github_release) -> string {
+@"One release announcement, sized for Discord: the link rides above the notes, so a cut costs prose
+and never the pointer to the rest of it."
+agent announcement(repository: github.repository_spec, release: github.github_release) {
   let notes = if (string.trim(value = release.notes) == "") { "" } else { f"\n\n${string.trim(value = release.notes)}" }
   string.fit(
-    value = f"New release on ${commands.render_repository(repository = repository)}: ${release.title} (${release.tag})\n${release.url}${notes}",
+    value = f"New release on ${github.render_repository(repository = repository)}: ${release.title} (${release.tag})\n${release.url}${notes}",
     cap = discord.limits().message_text,
     marker = "\n… (release notes cut to fit one Discord message; the full notes are at the link above)",
   )
 }
 
-@"Check ONE repository and commit what happened — the ONE place a probe is judged against the
-cursor. A first successful check primes the baseline silently (a watch starts at now, never with
-the backlog); a release past the baseline is announced; a dropped announcement HOLDS the cursor so
-the next tick retries it (no retry is baked in anywhere else). The announcement rides AHEAD of the
-state write, so a crash in that seam re-announces once rather than losing a release: announcements
-are at-least-once, as the README says."
-agent check_repository(channel: string, name: string, repository: commands.repository_spec) -> null with store.shared | discord.credential | io | prelude.throw[json.validation_error | discord.auth_error] {
-  let previous = match (watch_list.read_state(name = name)) {
-    case null -> watch_list.no_baseline()
-    case state -> state.cursor
+@"Check one repository and commit what happened — the one place a probe is judged against the cursor.
+A dropped announcement holds the cursor, and the post rides ahead of the state write, so a crash in
+that seam re-announces once rather than losing a release: announcements are at-least-once."
+agent check_repository(channel: string, row: watch_list.watch) {
+  let previous = row.state.cursor
+  agent commit(cursor: watch_list.cursor, outcome: watch_list.check_outcome) {
+    watch_list.write_state(repository = row.repository, state = watch_list.watch_state(cursor = cursor, outcome = outcome))
   }
-  agent commit(cursor: watch_list.cursor, outcome: watch_list.check_outcome) -> null with store.shared {
-    watch_list.write_state(name = name, state = watch_list.watch_state(cursor = cursor, outcome = outcome))
-  }
-  agent announce(release: github.github_release) -> null with store.shared | discord.credential | io | prelude.throw[discord.auth_error] {
-    match (discord.try_send(channel = channel, text = announcement(repository = repository, release = release))) {
+  agent announce(release: github.github_release) {
+    match (discord.try_send(channel = channel, text = announcement(repository = row.repository, release = release))) {
       case discord.delivered(_) -> commit(cursor = watch_list.announced_up_to(tag = release.tag), outcome = watch_list.release_announced(tag = release.tag))
       case discord.dropped(reason => reason) -> commit(cursor = previous, outcome = watch_list.announcement_dropped(tag = release.tag, reason = reason))
     }
   }
-  match (github.probe_release(repository = repository)) {
+  match (github.probe_release(repository = row.repository)) {
     case github.probe_failed(reason => reason) -> commit(cursor = previous, outcome = watch_list.check_failed(reason = reason))
     case github.no_release_yet(_) -> {
       match (previous) {
@@ -146,144 +162,83 @@ agent check_repository(channel: string, name: string, repository: commands.repos
   }
 }
 
-// ── the control desk's turn ───────────────────────────────────────────────────────────────────────
-
-@"One desk turn: dispatch a parsed command and answer with the reply text. `watch` is a
-check-then-register and `unwatch` a lookup-then-forget; both are sound WITHOUT a lock because the
-desk is sequential — its FIFO is the duplicate guard."
-agent serve_command(parsed: commands.command) -> string with store.shared | prelude.throw[json.validation_error] {
-  match (parsed) {
-    case commands.watch_requested(repository => repository) -> {
-      let subject = commands.render_repository(repository = repository)
-      match (watch_list.find_watch(repository = repository)) {
-        case null -> {
-          let name = watch_list.save_watch(repository = repository)
-          f"Watching ${subject} as `${name}`. The first check sets the baseline: releases published from now on are announced here."
-        }
-        case name -> f"Already watching ${subject} as `${name}`."
-      }
+@"The poll loop — one fiber over the whole watch list rather than one per repository: a tick reads
+the current keys and checks each in turn, so `watch` and `unwatch` need no fork/cancel reconcile. The
+interval is clamped to at least a minute, since `time.interval` demands a positive period."
+agent poll_source() -> never with store.get | store.exclusive | discord.credential | io | prelude.throw[discord.auth_error] {
+  use supervise.forever()
+  use supervise.signal_panics[never]()
+  let channel = watch_channel()
+  let interval_minutes = math.max(left = poll_minutes(), right = 1)
+  agent tick(time: number) {
+    let _checked = for (let row in watch_list.read_watches()) {
+      next check_repository(channel = channel, row = row)
     }
-    case commands.unwatch_requested(repository => repository) -> {
-      let subject = commands.render_repository(repository = repository)
-      match (watch_list.find_watch(repository = repository)) {
-        case null -> f"Not watching ${subject} — `list` shows what is."
-        case name -> {
-          watch_list.remove_watch(name = name)
-          f"Stopped watching ${subject} (`${name}`)."
-        }
-      }
-    }
-    case commands.list_requested(_) -> {
-      let rows = watch_list.read_watches()
-      if (array.length(target = rows) == 0) {
-        "Watching nothing. `watch owner/name` starts one."
-      } else {
-        let lines = for (let row in rows) { next watch_list.render_row(row = row) }
-        string.join(parts = lines, separator = "\n")
-      }
-    }
-    case commands.help_requested(note => note) -> {
-      if (note == "") { commands.help_text() } else { f"${note}\n${commands.help_text()}" }
-    }
+    null
   }
+  time.watch(schedule = time.interval(milliseconds = interval_minutes * 60000), deliver_to = tick)
 }
 
 // ── boot and entry ────────────────────────────────────────────────────────────────────────────────
 
-@"Boot's probe and report in one post: the online line (watch count, rows dropped by the sweep)
-sent with `send_message` — NOT `try_send`, so a typo'd channel id fails the boot loudly instead of
-making every later announcement a silently-dropped post. Answers \"\" on a clean boot."
-agent boot_probe(channel: string, swept: fleet.sweep_result[commands.repository_spec]) -> string with discord.credential | io {
+@"Boot's one post, sent with `send_message` rather than `try_send`, so a typo'd channel id fails the
+boot instead of making every later announcement a silently dropped post. Answers \"\" on a clean boot."
+agent boot_probe(channel: string) {
   use handler {
     request prelude.throw(error: discord.discord_error) -> never {
       break f"failed: could not post to WATCH_CHANNEL — the channel id looks wrong or the bot lacks access there (${json.stringify(value = error)})."
     }
   }
-  let dropped = if (array.length(target = swept.dropped) == 0) {
-    ""
-  } else {
-    f"\nDropped unreadable watch rows on boot: ${string.join(parts = swept.dropped, separator = ", ")} — `watch` them again if they still matter."
-  }
-  let _posted = discord.send_message(channel = channel, text = f"(release-watch online — watching ${string.to_string(value = array.length(target = swept.kept))} repositories; `list` shows them)${dropped}")
+  let _posted = discord.send_message(channel = channel, text = "(release-watch online — say `watch owner/name` here to add a repository)")
   ""
 }
 
-@"Entry: run the release monitor. Boot refuses loudly on missing config, sweeps the durable watch
-list (validate-or-drop), proves the channel is postable with one online line, then serves forever —
-a runtime restart costs the interrupted call and nothing else, and the crash policy below forks the
-dead watch again. Run it detached: `katari run release_watch.main --detach`."
+@"Entry: run the release monitor. Boot refuses loudly on missing config, proves the channel is
+postable with one online line, then serves forever: `katari run release_watch.main --detach`."
 agent main() -> string {
-  // A panic that reaches HERE ends the run with one line: it is a call the runtime interrupted on this
-  // desk's own path. A FIBER's panic never arrives here — it is `region.crashed` below, forked again.
   use handler { request panic(msg: string) { break f"failed: ${msg}" } }
-  // The fatal sink. Anything still flying here — a missing or revoked Discord token, a stored shape
-  // that stopped parsing — is a failure no fresh fork and no future tick heals, and a stopped run is
-  // a fact somebody notices, where an absorbed fatal is a monitor that silently watches nothing.
+  // The fatal sink: a revoked token answers the same however often it is retried, so the run stops.
   use handler {
-    request prelude.throw(error: unknown) -> never { break f"fatal: ${json.stringify(value = error)}" }
+    request prelude.throw(error: app_error) -> never { break f"fatal: ${json.stringify(value = error)}" }
   }
   let channel = watch_channel()
   if (channel == "") {
-    return "failed: the non-secret env WATCH_CHANNEL must be set — `katari env set WATCH_CHANNEL <channel id>`. Commands and announcements both live there."
+    return "failed: the non-secret env WATCH_CHANNEL must be set — `katari env set WATCH_CHANNEL <channel id>`. The curator listens there and releases are announced there."
   } else {
     null
   }
-  // The provider connects NOTHING: it serves the bot token, resolved per call, and a call that needs
-  // the gateway opens one for its own lifetime. So nothing here points into the sidecar's memory and
-  // there is no session to supervise — token plus channel is a whole reference, from any process.
   use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
-  // The app's place and serial domain, then the shared place INSIDE it — that order is the
-  // contract that lands `fleet`'s critical sections (name minting) in a real serial domain.
+  use anthropic.provider(source = credentials.env(key = "ANTHROPIC_API_KEY"))
+  // One workspace: the tools and the poll fiber resolve to the same `release_watch/watches/…`.
   use store.workspace(path = "release_watch")
-  use store.share
-  let swept = watch_list.sweep_watches()
-  // The probe answers "" for a clean boot and a sentence otherwise. A sentinel string, deliberately,
-  // where the cursor next door is a sum: this value is read ONCE, two lines from where it is made,
-  // and never stored — so a sum would buy nothing the two arms below do not already say, and the
-  // reasons a cursor must be a sum (a reader far away, a value that outlives the run) are all absent.
-  match (boot_probe(channel = channel, swept = swept)) {
+  match (boot_probe(channel = channel)) {
     case "" -> null
     case failure -> { return failure }
   }
-  // THE CONTROL DESK: sequential on purpose even with no `var` — see `serve_command`. A dropped
-  // reply is matched, not ignored: `dropped` means the one channel this desk can speak in refused
-  // the post, so there is nowhere to re-report it — the operator's unanswered command is the
-  // visible symptom, and retyping it is the retry.
-  use handler {
-    request control_message(message: discord.message) {
-      // Every reply is bounded here, at the desk's one send site, so a long `list` is cut with a
-      // marker instead of being refused whole by Discord's cap.
-      let reply = string.fit(
-        value = serve_command(parsed = commands.parse_command(text = message.text)),
-        cap = discord.limits().message_text,
-        marker = "\n… (cut to fit one Discord message)",
-      )
-      let _outcome = match (discord.try_send(channel = message.channel, text = reply)) {
-        case discord.delivered(_) -> null
-        case discord.dropped(reason => _) -> null
-      }
-      next null
-    }
-  }
-  let nursery: region.nursery[monitor_scope, monitor_ceiling] = use region.provide[monitor_scope, monitor_ceiling]
-  // WHAT A FIBER'S DEATH MEANS — and there is little left to say, because each fiber supervises
-  // ITSELF: a panic is converted inside the fiber and answered by its own backoff, so it never
-  // reaches here. Only a budget the fiber could not keep escapes, as a THROW, and a throw that got
-  // this far is a fault no fresh start heals (a revoked token, a stored shape that stopped parsing).
-  // So `failed` rides to the fatal sink, and `crashed` — which nothing here can now raise — reports
-  // rather than guesses.
+  // The curator and the poll fiber are the run, and a restart would have to stand at the altitude of
+  // what died — inside the route, where this program deliberately puts none. Everything else is one
+  // errand.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
-      let _outcome = discord.try_send(channel = channel, text = f"(fiber ${name} crashed: ${message} — nothing is started again; its own supervisor would have.)")
-      next null
+      if (name == "curator" || name == "poller") {
+        prelude.throw(error = fiber_died(name = name, detail = f"it was interrupted mid-step (${message})"))
+      } else {
+        next null
+      }
     }
     request region.failed(id: string, name: string, error: unknown) {
       prelude.throw(error = fiber_died(name = name, detail = json.stringify(value = error)))
     }
   }
-  // A fork's @argument@ is the task's whole parameter record, exactly as a call's arguments are — so
-  // each of these reads as the call it is a deferred version of.
-  let _control = region.fork(nursery = nursery, task = control_source, argument = { channel = channel }, name = "control-source")
-  let _poll = region.fork(nursery = nursery, task = poll_source, argument = { channel = channel }, name = "poll-loop")
-  region.watch(nursery = nursery)
+  let root = use ai.route[watch_effects]()
+  let _curator = ai.spawn[watch_effects](
+    name = "curator",
+    tools = [watch, unwatch, list_watches],
+    max_steps = 8,
+    persona = curator_persona,
+    deliver_to = post_reply,
+    sources = [channel_watcher],
+  )
+  let _poller = region.fork(nursery = root, task = poll_source, argument = {}, name = "poller")
+  region.watch(nursery = root)
 }

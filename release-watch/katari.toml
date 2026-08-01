@@ -8,4 +8,4 @@ url = "http://localhost:3000"
 [dependencies]
 registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
 snapshot = "snapshot-2026-07-31-59401211"
-packages = ["web", "discord", "fleet"]
+packages = ["web", "discord", "ai"]

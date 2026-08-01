@@ -1,43 +1,39 @@
-// The GitHub side of the monitor: one public JSON endpoint, one TOTAL probe. No GitHub credential
-// is used (public release feeds need none), so no failure on this path is a config error: every
-// way a probe can fail folds into `probe_failed` and the poll loop carries it as a value — the
-// outcome-as-value convention, with the next tick as the only retry policy.
+// The GitHub side of the monitor: one public JSON endpoint, one total probe. No credential is used
+// here, so every way a probe can fail folds into `probe_failed` and the next tick is the only retry.
 
-import release_watch.commands
 import web
 
-@"One release, as this monitor cares about it — read out of GitHub's payload at the fetch
-boundary, so nothing downstream touches raw JSON."
-data github_release(
-  @"The release's git tag — the durable identity the cursor stores." tag: string,
-  @"The release's display name; the tag when the author left it blank." title: string,
-  @"The release page URL — always announced, so a cut announcement still links to everything." url: string,
-  @"The release notes body, possibly empty." notes: string,
-)
+@"One GitHub repository, as the two path segments its releases API is addressed by."
+data repository_spec(owner: string, name: string)
 
-@"The probe found the repository's latest release."
-data latest_release(@"The latest release, per GitHub's newest-first ordering." release: github_release)
+@"One release, read out of GitHub's payload at the fetch boundary: @tag@ is the durable identity the
+cursor stores, @url@ is always announced, @title@ falls back to the tag, @notes@ may be empty."
+data github_release(tag: string, title: string, url: string, notes: string)
+
+@"The probe found the repository's latest release, per GitHub's newest-first ordering."
+data latest_release(release: github_release)
 
 @"The repository is reachable but has published no releases yet."
 data no_release_yet()
 
-@"The probe failed; @reason@ is the one-line diagnosis `list` shows — a 404 for a typo'd name, a
-rate limit, a network fault, an unparseable payload. A VALUE, because the loop must outlive it."
-data probe_failed(@"Why the check failed, in one line." reason: string)
+@"The probe failed; @reason@ is the one-line diagnosis a listing shows (a 404, a rate limit, a
+network fault, an unparseable payload)."
+data probe_failed(reason: string)
 
 // What one poll of one repository can find. (Type synonyms take no docs.)
 type probe = latest_release | no_release_yet | probe_failed
 
-@"The repository's releases endpoint, newest first, one entry — public JSON, no authentication.
-Segments are URL-encoded so an odd typed character becomes GitHub's own 404, not another request."
-agent releases_url(repository: commands.repository_spec) -> string {
+agent render_repository(repository: repository_spec) {
+  f"${repository.owner}/${repository.name}"
+}
+
+// Segments are URL-encoded, so an odd character becomes GitHub's own 404 rather than another request.
+agent releases_url(repository: repository_spec) {
   f"https://api.github.com/repos/${string.url_encode(value = repository.owner)}/${string.url_encode(value = repository.name)}/releases?per_page=1"
 }
 
-@"One folded probe failure as the line `list` shows. The status is read, never re-derived. 403 is
-worded as the rate limit because that is what an UNAUTHENTICATED GitHub poll's 403 is — there is no
-credential on this path, so web's auth reading has no referent here."
-agent describe_failure(error: http.api_error | http.auth_error | http.fetch_error | json.parse_error) -> string {
+// 403 is worded as the rate limit because that is what an unauthenticated GitHub poll's 403 is.
+agent describe_failure(error: http.api_error | http.auth_error | http.fetch_error | json.parse_error) {
   match (error) {
     case http.api_error(status => status, context => _, message => _) -> {
       match (status) {
@@ -51,29 +47,22 @@ agent describe_failure(error: http.api_error | http.auth_error | http.fetch_erro
   }
 }
 
-@"THE total probe: one repository's latest release as a value, never a throw. The converter turns the
-transport's whole throw union into the supervision signal and `supervise.once` hands it back — once,
-because a failed probe is the next tick's business, not this one's."
-agent probe_release(repository: commands.repository_spec) -> probe with io {
+@"One repository's latest release as a value, never a throw: the converter turns the transport's throw
+union into the supervision signal and `supervise.once` hands it back, once."
+agent probe_release(repository: repository_spec) -> probe with io {
   match (supervise.once(task = agent () -> probe {
     use supervise.signal_throws[http.api_error | http.auth_error | http.fetch_error | json.parse_error]()
-    // `fetch_page`'s default budget (16000 code points) can cut a long release body MID-DOCUMENT
-    // and a cut document fails to parse, so the budget is raised far past any single release
-    // payload; one that still overflows folds into `probe_failed` via the parse error, which is
-    // the honest reading of a document we provably do not have whole.
+    // A cut document fails to parse, so the budget is raised far past any single release payload.
     let body = web.fetch_page(url = releases_url(repository = repository), max_characters = 400000)
     match (json.element(target = json.parse(text = body), index = 0)) {
       case null -> no_release_yet()
       case entry -> {
         let tag = json.text(target = json.field(target = entry, key = "tag_name"))
         if (string.trim(value = tag) == "") {
-          // A 200 whose first entry carries no tag is not a release list; say so rather than guess.
           probe_failed(reason = "GitHub answered 200 but the payload does not look like a release list")
         } else {
           latest_release(release = github_release(
             tag = tag,
-            // The fallback is where a blank display name becomes the tag — `json.text`'s own
-            // parameter, so an absent field and a `null` one take the same arm.
             title = json.text(target = json.field(target = entry, key = "name"), fallback = tag),
             url = json.text(target = json.field(target = entry, key = "html_url")),
             notes = json.text(target = json.field(target = entry, key = "body")),
