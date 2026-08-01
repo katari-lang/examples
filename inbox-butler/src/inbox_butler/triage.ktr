@@ -1,5 +1,4 @@
-// The triage seam: one model call turns one raw mail into one typed verdict, and nothing else in the
-// program ever sees the model. A failure is an ARM of the sum — the butler must outlive a bad step.
+// The triage seam: one model call turns one raw mail into one typed verdict; a failure is an arm of the sum.
 
 import ai
 import ai.types
@@ -8,26 +7,23 @@ import gmail
 @"The mail does not ask for a meeting — the butler stays quiet about it, by design."
 data not_event()
 
-@"The mail looks like it wants a calendar event. Every field is a PROPOSAL for a prefilled form,
-never something acted on without a click."
+@"The mail looks like it wants a calendar event. Every field is a PROPOSAL for a prefilled form, never something acted on without a click."
 data event_candidate(
-  @"A short calendar title, e.g. \"Coffee with Alice\"." title: string,
-  @"The proposed start as an RFC3339 timestamp with a UTC offset, in the operator's timezone." start_rfc3339: string,
-  @"The proposed length in minutes." duration_minutes: integer,
+  title: string,
+  @"RFC3339 with a UTC offset, in the operator's timezone." start_rfc3339: string,
+  duration_minutes: integer,
   @"The stated place or meeting link; empty when the mail names none." location: string,
   @"One sentence for the operator: why this mail reads as a meeting request." note: string,
 )
 
-@"This mail could not be triaged — the mailbox read or the model step failed recoverably. A VALUE:
-the desk reports it and moves on, and the mail itself is untouched in the inbox."
+@"This mail could not be triaged — the mailbox read or the model step failed recoverably. The desk reports it and moves on; the mail is untouched in the inbox."
 data triage_failed(@"What failed, in one clause." reason: string)
 
 // One mail's triage, read once by the desk. (Type synonyms take no docs.)
 type triage_outcome = not_event | event_candidate | triage_failed
 
-// An OBJECT type, not a data sum: `infer_structured` reifies this as the response schema, and an
-// object is the friendliest shape a model can fill (a data type would demand its `$katari_constructor`
-// wrapper too). The `verdict` string becomes the sum below — this module's one string boundary.
+// An object type and not a data sum: `infer_structured` reifies this as the response schema, and an
+// object is the friendliest shape a model can fill. Its `verdict` string becomes the sum below.
 type triage_shape = {
   verdict: string,
   title: string,
@@ -37,15 +33,13 @@ type triage_shape = {
   note: string,
 }
 
-@"Triage one mail: read its body, ask the model for the shape, and answer the verdict SUM. ONE guard
-covers both fallible calls, because they fail with the same vocabulary: a transient mailbox or model
-failure folds into `triage_failed`, while `http.auth_error` re-raises — a rejected token never heals,
-and absorbing it would leave a butler that looks alive and quietly triages nothing."
+@"Triage one mail: read its body, ask the model for the shape, and answer the verdict SUM. One guard
+covers both fallible calls: a transient mailbox or model failure folds into `triage_failed`, while
+`http.auth_error` re-raises, since a rejected token never heals."
 agent triage_mail(message: gmail.message, zone: string) -> triage_outcome with gmail.credential | ai.infer_object | io | prelude.throw[http.auth_error] {
   use handler {
     request prelude.throw(error: ai.step_error | json.validation_error) -> never {
-      // Name what is ABSORBED, let the residual fly. A step error this package grows later then
-      // stops the butler instead of being reported as one more untriaged mail.
+      // Name what is absorbed, let the residual fly: a step error added later stops the butler.
       let why = match (error) {
         case ai.provider_error(source => source, message => text, transient => _, detail => _) -> f"the model provider failed (${source}: ${text})"
         case http.api_error(status => status, context => context, message => text) -> f"an http call was refused (${context}: ${string.to_string(value = status)} — ${text})"
@@ -58,24 +52,20 @@ agent triage_mail(message: gmail.message, zone: string) -> triage_outcome with g
     }
   }
   let body = gmail.read_body(id = message.id)
-  // The operator's wall clock rides the prompt so relative dates resolve against it. The zero-offset
-  // arm is a formality (`main` refused unresolvable zones); UTC would still name the same instant.
+  // The operator's wall clock rides the prompt so relative dates resolve against it.
   let now = time.now()
   let offset = match (time.zone_offset(epoch_milliseconds = now, zone = zone)) {
     case null -> 0
     case minutes -> minutes
   }
   let clock = f"${time.weekday_label(day = time.day_of_week(epoch_milliseconds = now, offset_minutes = offset))} ${time.to_rfc3339(epoch_milliseconds = now, offset_minutes = offset)}"
-  // Plain text, raw markup, or only Gmail's snippet — told to the model as data, so it can read
-  // through tags instead of quoting them.
+  // The body's shape is told to the model as data, so it reads through tags instead of quoting them.
   let body_kind = match (body.content_type) {
     case "text/plain" -> "plain text"
     case null -> "only Gmail's short snippet preview — the full body was unreadable"
     case recorded -> f"raw ${recorded} markup; read the content through the tags"
   }
-  // A newsletter-sized mail must cost a bounded prompt, and the cut must SAY so — a silent cut
-  // would let the model answer from a fragment as though it had the whole. `string.fit` pays for the
-  // marker out of the budget rather than adding it on top, so the bound really is the bound.
+  // A newsletter-sized mail must cost a bounded prompt, and the cut must say so, or the model answers from a fragment.
   let clipped_body = string.fit(
     value = body.text,
     cap = 16000,
@@ -94,8 +84,7 @@ agent triage_mail(message: gmail.message, zone: string) -> triage_outcome with g
     clipped_body,
   ])
   let shape = ai.infer_structured[triage_shape](history = [types.turn(role = types.user_role(), text = prompt)])
-  // The string boundary: the model's verdict word becomes the sum here, and the catch-all arm makes
-  // any unexpected spelling read as "not a meeting" — the quiet verdict, which fails closed.
+  // The string boundary: any unexpected spelling reads as "not a meeting", the verdict that fails closed.
   match (string.to_lower(value = string.trim(value = shape.verdict))) {
     case "meeting" -> event_candidate(title = shape.title, start_rfc3339 = shape.start_rfc3339, duration_minutes = shape.duration_minutes, location = shape.location, note = shape.note)
     case _other -> not_event()
