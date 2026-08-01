@@ -27,8 +27,8 @@ in [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execut
 
 Reading order: `release-watch` (one AI, three tools, one deterministic fiber) → `standup-scribe` (one
 model step behind an approval gate) → `concierge` (two AIs on one route, mail between them) →
-`inbox-butler` (multi-provider composition). `concierge` is where the
-[tutorial](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) sends you after its last chapter.
+`inbox-butler` (multi-provider composition). `concierge` is where the tutorial's
+[last chapter](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent) sends you.
 
 ## Running an example
 
