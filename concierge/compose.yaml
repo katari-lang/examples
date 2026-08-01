@@ -20,6 +20,11 @@ services:
       PORT: 3000
       LOG_LEVEL: info
       DATABASE_URL: postgres://katari:katari@postgres:5432/katari
+      # The sibling postgres speaks no TLS, and a service name is not provably local — so say it.
+      DATABASE_SSL: disable
+      # The address external services reach this runtime at: webhook / MCP endpoint URLs and the
+      # OAuth callback are minted under it. localhost serves a single-machine stack.
+      KATARI_PUBLIC_URL: ${KATARI_PUBLIC_URL:-http://localhost:3000}
       # The API key callers (the CLI, the web console) authenticate with — sent as a Bearer token.
       # Required: the runtime refuses to boot without it. Distinct from the at-rest key below.
       KATARI_API_KEY: ${KATARI_API_KEY:?set KATARI_API_KEY in .env (see .env.example)}
