@@ -6,35 +6,29 @@ resident agent. Every example pins a published registry snapshot and compiles in
 published CLI, so what you clone is what runs.
 
 If you are new to Katari, start with the [quickstart](https://katari-lang.dev/docs/v0.1/getting-started/quickstart)
-and the [tutorial](https://katari-lang.dev/docs/v0.1/tutorial) — the examples here begin where
-the tutorial ends, and each README says which guides it puts to work.
+and the [tutorial](https://katari-lang.dev/docs/v0.1/tutorial) — the examples here begin where the
+tutorial ends.
 
-| Example | Use case | What it teaches |
+| Example | Use case | What it shows |
 | --- | --- | --- |
-| [`release-watch`](release-watch/) | A GitHub release monitor you manage from Discord | Durable scheduling, the desired-set (fleet) pattern, store cursors, folding HTTP failures without dying |
+| [`release-watch`](release-watch/) | A GitHub release monitor with a Discord front desk | One AI whose three tools are the watch list, beside a deterministic poll fiber that announces releases at-least-once |
 | [`standup-scribe`](standup-scribe/) | A Slack standup bot with a human-approved digest | Message plane vs interaction plane, ask controls, approval before posting, scheduled jobs with timezones |
-| [`concierge`](concierge/) | A two-agent Discord community concierge | Several AIs on one route, one `ai.spawn` per AI, mail between them, a capability membrane made of two tool lists |
-| [`inbox-butler`](inbox-butler/) | Gmail triage that proposes calendar events for one-click approval | OAuth credentials and a boot preflight, AI triage with structured output, the approval-gate idiom |
+| [`concierge`](concierge/) | A two-agent Discord community concierge | Two AIs on one route, one `ai.spawn` each, mail between them, a capability membrane made of two tool lists |
+| [`inbox-butler`](inbox-butler/) | Gmail triage that proposes calendar events for one-click approval | OAuth credentials, AI triage with structured output, the approval-gate idiom, a region policy that re-forks one fiber kind |
 
 All four are **residents**: long-running programs that stay on a channel or a schedule rather than
-running once and exiting. So all four also answer the question a resident cannot avoid — what happens
-when the runtime restarts under it. Every package call here carries the credential it acts with, never
-a handle into a sidecar's memory, so a restart costs exactly the **one call it interrupted**, and there
-is no session to rebuild and no reconnect to arrange. Where the answer to that one interrupted call
-lives differs on purpose: three of the four put it *inside* the fiber (`use supervise.forever()` plus a
-panic converter, so the watch simply runs again after a backoff and nothing above it is rebuilt), while
-`inbox-butler` answers it at the region, because its two fiber kinds want opposite answers — a mail
-watch is re-forked, an unasked question is not. Each README says plainly what comes through (store
-state, a collected window) and what the interruption costs (the messages nobody was listening for, an
-open question, a conversation that was mid-turn). The rule is
-[What may cross the boundary](https://katari-lang.dev/docs/v0.1/guides/ffi-sidecars) and the mechanism
-under it is in [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution).
+running once and exiting. Every package call here carries the credential it acts with, never a handle
+into a sidecar's memory, so a runtime restart costs exactly the **one call it interrupted**. Three of
+the four answer that call inside the fiber (`use supervise.forever()` plus a panic converter, so the
+watch runs again after a backoff and nothing above it is rebuilt); `inbox-butler` answers it at the
+region, because its two fiber kinds want opposite answers — a mail watch is re-forked, an unasked
+question is not. Each README says what comes through and what the interruption costs. The mechanism is
+in [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution).
 
-Reading order: `release-watch` (no model, the durable skeleton alone) → `standup-scribe` (one model
-step, one approval gate) → `concierge` (two AIs on one route, mail between them) → `inbox-butler`
-(multi-provider composition). `concierge` is where the
-[tutorial](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) sends you after its last chapter,
-so it is the shortest step up from there.
+Reading order: `release-watch` (one AI, three tools, one deterministic fiber) → `standup-scribe` (one
+model step behind an approval gate) → `concierge` (two AIs on one route, mail between them) →
+`inbox-butler` (multi-provider composition). `concierge` is where the
+[tutorial](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) sends you after its last chapter.
 
 ## Running an example
 
