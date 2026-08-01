@@ -1,6 +1,6 @@
 [package]
 name = "concierge"
-description = "A two-desk Discord concierge: a public face that answers only from notes its owner publishes from a private control channel."
+description = "A two-agent Discord concierge: a public face that answers only from notes it can read, and a private curator that is the only thing allowed to write them."
 
 [runtime]
 url = "http://localhost:3000"
