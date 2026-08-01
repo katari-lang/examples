@@ -14,7 +14,7 @@ import slack
 // ─── configuration ────────────────────────────────────────────────────────────────────────────────
 
 @"Everything the resident reads from the project env at boot, carried as one value so the schedule
-fiber and the crash policy see exactly the configuration the boot validated."
+fiber sees exactly the configuration the boot validated — every re-run of it included."
 data settings(
   @"The channel the standup opens in and the approved digest posts to." standup_channel: string,
   @"Where the review question and every operator-facing note go; may equal the standup channel." facilitator_channel: string,
@@ -28,8 +28,8 @@ opens a window."
 data missing_config(name: string)
 
 @"STANDUP_HOUR is outside 0-23. Thrown at boot: `time.cron` would panic inside the schedule fiber
-instead, and the crash policy — which forks a panicked fiber again — would fork it straight back into
-the same panic, forever."
+instead, and that fiber supervises itself — so it would run straight back into the same panic, forever,
+one attempt per backoff step."
 data bad_hour(hour: integer)
 
 @"WINDOW_MINUTES is not at least one minute. Thrown at boot for the quiet failure it otherwise is: a
@@ -50,6 +50,18 @@ data fiber_failure(name: string, detail: string)
 type app_error =
   slack.slack_error | env.missing_secret | oauth.server_error
   | missing_config | bad_hour | bad_window | bad_timezone | fiber_failure
+
+@"One env entry read as a whole number, or @fallback@ when it is unset or is not one. The env plane is
+strings, so the parse belongs at the READ site: `env.get_or` hands back the raw text precisely because
+what an unparseable knob should mean is the program's judgement, and here it is `fallback` — the same
+answer an unset entry gets, since both are \"nobody chose\". The RANGE is judged separately, at boot,
+where a wrong number gets its own refusal."
+agent whole_number(key: string, fallback: integer) -> integer {
+  match (string.to_integer(value = string.trim(value = env.get_or(key = key, fallback = "")))) {
+    case null -> fallback
+    case value -> value
+  }
+}
 
 // ─── the bus ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -94,7 +106,7 @@ type window_state = idle | collecting
 
 @"One window as the STORE remembers it: the prompt's `ts` — the thread every entry hangs under — and
 the instant it closes. Keeping BOTH facts outside the fiber is what lets a window outlive the fiber
-that opened it, so a fiber forked again mid-window picks the day back up instead of losing it."
+that opened it, so a fiber re-run mid-window picks the day back up instead of losing it."
 data recorded_window(prompt_ts: string, close_at: number)
 
 @"Nothing is recorded for the date, so no window is open and there is none to resume."
@@ -132,8 +144,13 @@ agent read_marker(date: string) -> marker with store.get {
   match (store.get(key = marker_key(date = date))) {
     case store.absent(key => _) -> no_window()
     case store.found(value => value) -> {
-      match (json.try_validate[marker_row](value = value)) {
-        case null -> unreadable_marker()
+      // `validate` states a mismatch by throwing and `catch` folds that throw into the answer, which is
+      // what keeps this read total: the row's three readings all arrive as arms of one `match`.
+      agent checked() -> marker_row with prelude.throw[json.validation_error] {
+        json.validate[marker_row](value = value)
+      }
+      match (prelude.catch(task = checked)) {
+        case json.validation_error(message => _) -> unreadable_marker()
         case row -> recorded_window(prompt_ts = row.prompt_ts, close_at = row.close_at)
       }
     }
@@ -172,18 +189,17 @@ agent tell_facilitator(channel: string, text: string) -> null with slack.credent
 message to the scribe desk. Collection policy lives at the desk, not here — the watcher reports
 everything and stays ignorant of windows. The watch opens the Socket Mode connection for its own
 lifetime, so a token Slack refuses is a throw HERE (the region's `failed` policy stops the run on
-one), and an interrupted watch is a panic the crash policy answers by forking this task again."
-agent channel_watcher(input: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error] {
-  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
-  // converter makes that the supervision signal and the provider opens a fresh connection after a
-  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
-  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
-  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
-  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
-  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+one), and an interrupted watch is a panic this fiber's own supervisor answers by running it again."
+agent channel_watcher(channel: string) -> never with channel_message | slack.credential | io | prelude.throw[slack.slack_error] {
+  // THE WATCH SUPERVISES ITSELF — the two lines below, on the package default backoff. A runtime
+  // restart interrupts this call and the frame panics; the converter makes that the supervision signal
+  // and the provider opens a fresh connection after a wait. The boundary is INSIDE the fiber, so state
+  // above it is not rebuilt by a re-run, and a defect that reproduces on every attempt settles at the
+  // delay ceiling. `forever`, not `exponential`: a bounded budget is a LIFETIME count that never
+  // resets, so it would kill a watch meant to outlive every deploy.
+  use supervise.forever()
   use supervise.signal_panics[never]()
-  slack.watch_messages(channel = input, deliver_to = agent (value: slack.message) -> null {
+  slack.watch_messages(channel = channel, deliver_to = agent (value: slack.message) -> null {
     channel_message(author = value.author, text = value.text, thread = value.thread)
   })
 }
@@ -192,21 +208,15 @@ agent channel_watcher(input: string) -> never with channel_message | slack.crede
 weekday at the configured hour — open the window, wait it out, close it, and see the digest through
 review. One fiber runs all of it deliberately: `time.watch` serializes deliveries so an occurrence can
 never overlap itself, and the desk stays free to collect while this fiber sleeps or waits on a human."
-agent standup_schedule(input: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal] {
-  // THE WATCH SUPERVISES ITSELF. A runtime restart interrupts this call and the frame panics; the
-  // converter makes that the supervision signal and the provider opens a fresh connection after a
-  // backoff — the credential is the whole of what the call needs, so nothing stale is inherited. The
-  // boundary is INSIDE the fiber, so state above it is not rebuilt by a re-run, and a defect that
-  // reproduces on every attempt settles at the delay ceiling — one attempt every fifteen minutes,
-  // visible in the run's events. `forever`, not `exponential`: a bounded budget is a LIFETIME count
-  // that never resets, so it would kill a watch meant to outlive every deploy on its fifth restart.
-  use supervise.forever(initial_delay_milliseconds = 1000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+agent standup_schedule(configuration: settings) -> never with schedule_effects | prelude.throw[occurrence_fatal] {
+  // THE WATCH SUPERVISES ITSELF — see `channel_watcher` for what those two lines buy.
+  use supervise.forever()
   use supervise.signal_panics[never]()
   @"The calendar date an instant falls on, read in the configured zone — what the marker and the digest
   are both named by. Boot validated the zone, so the null arm is configuration drift, not weather."
   agent date_of(instant: number) -> string with prelude.throw[bad_timezone] {
-    match (time.zone_offset(epoch_milliseconds = instant, zone = input.timezone)) {
-      case null -> prelude.throw(error = bad_timezone(zone = input.timezone))
+    match (time.zone_offset(epoch_milliseconds = instant, zone = configuration.timezone)) {
+      case null -> prelude.throw(error = bad_timezone(zone = configuration.timezone))
       case minutes -> time.date_label(epoch_milliseconds = instant, offset_minutes = minutes)
     }
   }
@@ -230,7 +240,7 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
           case rest -> prelude.throw(error = rest)
         }
         tell_facilitator(
-          channel = input.facilitator_channel,
+          channel = configuration.facilitator_channel,
           text = f"(standup ${date}: gave up — ${line}. Nothing was posted; the schedule stays armed for the next weekday.)",
         )
         break null
@@ -243,8 +253,8 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
       // guards the file-upload path), so the marker is never written blank.
       case open_fresh(close_at => close_at) -> {
         let posted = slack.send_message(
-          channel = input.standup_channel,
-          text = f"Standup time! Reply in this thread within ${string.to_string(value = input.window_minutes)} minutes: yesterday / today / blockers.",
+          channel = configuration.standup_channel,
+          text = f"Standup time! Reply in this thread within ${string.to_string(value = configuration.window_minutes)} minutes: yesterday / today / blockers.",
         )
         store.set(key = marker_key(date = date), value = { prompt_ts = posted, close_at = close_at })
         recorded_window(prompt_ts = posted, close_at = close_at)
@@ -259,16 +269,18 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
     if (array.length(target = entries) == 0) {
       // Nobody replied: no model call, no review — one line so the facilitator knows the silence
       // was the team's, not the scribe's.
-      tell_facilitator(channel = input.facilitator_channel, text = f"(standup ${date}: no entries in the window — nothing to digest.)")
+      tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: no entries in the window — nothing to digest.)")
     } else {
-      // Fit ONCE, here: 3000 is both the message cap an ask's prompt fails at and the form field's
-      // content bound, so this one fitted string is what the preview quotes, what prefills the Edit
-      // box, and what posts.
-      let draft = slack.fit_message(
-        text = draft_digest(date = date, entries = entries),
-        marker = "\n… (cut to fit Slack's 3000-character cap)",
+      // Fit ONCE, here: `slack.limits().message_text` is both the cap an ask's prompt fails at and the
+      // form field's content bound, so this one fitted string is what the preview quotes, what prefills
+      // the Edit box, and what posts. The cap is Slack's to publish; the cut arithmetic — paying for the
+      // marker out of the budget rather than adding it on top — is `string.fit`'s.
+      let draft = string.fit(
+        value = draft_digest(date = date, entries = entries),
+        cap = slack.limits().message_text,
+        marker = "\n… (cut to fit Slack's message cap)",
       )
-      review_and_post(configuration = input, date = date, draft = draft)
+      review_and_post(configuration = configuration, date = date, draft = draft)
     }
   }
   @"One scheduled occurrence. @time@ is the occurrence's SCHEDULED epoch millisecond, not the delivery
@@ -276,19 +288,19 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
   close instant derived from it the same on every delivery of the same occurrence."
   agent occurrence(time: number) -> null with schedule_effects | prelude.throw[occurrence_fatal] {
     let date = date_of(instant = time)
-    let close_at = time + input.window_minutes * 60000
+    let close_at = time + configuration.window_minutes * 60000
     match (read_marker(date = date)) {
       // A row exists but cannot be read, so its prompt IS already in the channel and only its lifetime
       // is unknown. Skipping is the safe half of that: a second prompt for a standup that opened is
       // worse than one skipped day, and the day is not skipped silently.
       case unreadable_marker(_) -> {
-        tell_facilitator(channel = input.facilitator_channel, text = f"(standup ${date}: the marker ${marker_key(date = date)} is not in a shape this version reads, so the prompt was NOT re-posted and today is skipped. Delete that row to let the scribe open a fresh window.)")
+        tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: the marker ${marker_key(date = date)} is not in a shape this version reads, so the prompt was NOT re-posted and today is skipped. Delete that row to let the scribe open a fresh window.)")
       }
       // Nothing recorded, and the window would already be over: this is the single catch-up `time.watch`
       // fires for an outage, so posting a prompt nobody can still reply to would only litter the channel.
       case no_window(_) -> {
         if (time.now() >= close_at) {
-          tell_facilitator(channel = input.facilitator_channel, text = f"(standup ${date}: missed — the scribe was down for the whole window, so no prompt was posted.)")
+          tell_facilitator(channel = configuration.facilitator_channel, text = f"(standup ${date}: missed — the scribe was down for the whole window, so no prompt was posted.)")
         } else {
           run_standup(date = date, opening = open_fresh(close_at = close_at))
         }
@@ -305,17 +317,18 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
       }
     }
   }
-  // RECOVERY, BEFORE THE WATCH — this is what a forked-again fiber costs and how the cost is paid. A
-  // runtime restart interrupts whichever Slack call this fiber was in, and the crash policy forks it
-  // fresh; a fresh `time.watch` arms on the NEXT occurrence, so today's open window would be left with
-  // nobody to close it. The store holds the window's identity AND its lifetime, so the new fiber picks
-  // it up and ends it on time. The watch arms after that, exactly as serialized deliveries would.
+  // RECOVERY, BEFORE THE WATCH — this is what a re-run fiber costs and how the cost is paid. A runtime
+  // restart interrupts whichever Slack call this fiber was in, and the supervisor above runs the body
+  // again from here; a fresh `time.watch` arms on the NEXT occurrence, so today's open window would be
+  // left with nobody to close it. The store holds the window's identity AND its lifetime, so the new
+  // attempt picks it up and ends it on time. The watch arms after that, exactly as serialized
+  // deliveries would.
   let now = time.now()
   let today = date_of(instant = now)
   match (read_marker(date = today)) {
     case no_window(_) -> null
     case unreadable_marker(_) -> {
-      tell_facilitator(channel = input.facilitator_channel, text = f"(scribe: today's marker (${marker_key(date = today)}) is not in a shape this version reads, so no window was resumed.)")
+      tell_facilitator(channel = configuration.facilitator_channel, text = f"(scribe: today's marker (${marker_key(date = today)}) is not in a shape this version reads, so no window was resumed.)")
     }
     case rest -> {
       if (now < rest.close_at) {
@@ -329,8 +342,8 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
   }
   time.watch(
     schedule = time.cron(
-      expression = f"0 ${string.to_string(value = input.standup_hour)} * * 1-5",
-      timezone = input.timezone,
+      expression = f"0 ${string.to_string(value = configuration.standup_hour)} * * 1-5",
+      timezone = configuration.timezone,
     ),
     deliver_to = occurrence,
   )
@@ -338,7 +351,7 @@ agent standup_schedule(input: settings) -> never with schedule_effects | prelude
 
 // ─── the digest ───────────────────────────────────────────────────────────────────────────────────
 
-@"Draft the digest in ONE model step over the collected entries — a one-shot `ai.reply`, not a chat
+@"Draft the digest in ONE model step over the collected entries — a one-shot `ai.infer`, not a chat
 loop: the scribe has nothing to converse about, and a single step keeps the failure surface exactly
 one guard wide."
 agent draft_digest(date: string, entries: array[entry]) -> string with ai.infer_step | prelude.throw[ai.step_error] {
@@ -352,7 +365,7 @@ agent draft_digest(date: string, entries: array[entry]) -> string with ai.infer_
     "Replies:",
     string.join(parts = lines, separator = "\n"),
   ], separator = "\n")
-  ai.reply(history = [types.turn(role = types.user_role(), text = briefing)])
+  ai.infer(history = [types.turn(role = types.user_role(), text = briefing)])
 }
 
 @"The three controls of one review: post as drafted, rewrite in place, or discard. The form ships
@@ -390,7 +403,7 @@ agent read_review(answer: slack.answer, draft: string) -> review {
         case null -> ""
         case text -> text
       }
-      if (string.is_blank(value = edited)) {
+      if (string.trim(value = edited) == "") {
         digest_discarded(reason = "the facilitator cleared the draft")
       } else {
         post_approved(text = edited)
@@ -416,8 +429,9 @@ agent review_and_post(configuration: settings, date: string, draft: string) -> n
       agent hold_review(value: null) -> slack.answer with slack.credential | io | prelude.throw[slack.slack_error] {
         slack.ask(
           channel = configuration.facilitator_channel,
-          prompt = slack.fit_message(
-            text = f"Standup digest for ${date} — press *Post it*, open *Edit* to rewrite it, or *Discard*.\n\n${draft}",
+          prompt = string.fit(
+            value = f"Standup digest for ${date} — press *Post it*, open *Edit* to rewrite it, or *Discard*.\n\n${draft}",
+            cap = slack.limits().message_text,
             marker = "\n… (preview cut; open Edit for the full draft)",
           ),
           controls = controls,
@@ -465,17 +479,19 @@ agent main() -> string with io | store.get | store.set {
       break f"standup-scribe stopped: ${json.stringify(value = error)}"
     }
   }
-  let standup_channel = match (env.get(key = "STANDUP_CHANNEL")) {
-    case null -> prelude.throw(error = missing_config(name = "STANDUP_CHANNEL"))
+  // An entry set to the empty string and one never set are one case here, deliberately: both are a
+  // channel this scribe cannot post in, and `env.get_or`'s reading is what makes that one branch.
+  let standup_channel = match (string.trim(value = env.get_or(key = "STANDUP_CHANNEL", fallback = ""))) {
+    case "" -> prelude.throw(error = missing_config(name = "STANDUP_CHANNEL"))
     case value -> value
   }
-  let standup_hour = env.get_integer_or(key = "STANDUP_HOUR", fallback = 9)
+  let standup_hour = whole_number(key = "STANDUP_HOUR", fallback = 9)
   if (standup_hour < 0 || standup_hour > 23) {
     prelude.throw(error = bad_hour(hour = standup_hour))
   } else {
     null
   }
-  let window_minutes = env.get_integer_or(key = "WINDOW_MINUTES", fallback = 60)
+  let window_minutes = whole_number(key = "WINDOW_MINUTES", fallback = 60)
   if (window_minutes < 1) {
     prelude.throw(error = bad_window(minutes = window_minutes))
   } else {
@@ -483,7 +499,7 @@ agent main() -> string with io | store.get | store.set {
   }
   let timezone = env.get_or(key = "STANDUP_TIMEZONE", fallback = "UTC")
   // Validate the zone at boot: `time.cron` panics on a zone it does not know, and that panic would
-  // land inside the schedule fiber, which the crash policy would fork straight back into it.
+  // land inside the schedule fiber, whose own supervisor would run it straight back into it.
   match (time.zone_offset(epoch_milliseconds = time.now(), zone = timezone)) {
     case null -> prelude.throw(error = bad_timezone(zone = timezone))
     case _ -> null
@@ -503,7 +519,7 @@ agent main() -> string with io | store.get | store.set {
   // at every request, and the Socket Mode connection belongs to the one call that needs events
   // (`watch_messages`, `ask`) for exactly as long as that call runs. So there is no session to rebuild
   // and no scope below this to supervise: nothing in this program points into the sidecar's process, a
-  // runtime restart costs the interrupted call, and the crash policy forks the dead fiber again. What
+  // runtime restart costs the interrupted call, which each fiber's own supervisor makes again. What
   // that buys is everything below staying put across a restart — above all the desk, whose collected
   // entries are run state nothing rebuilds.
   use slack.provider(
@@ -523,9 +539,12 @@ agent main() -> string with io | store.get | store.set {
             case null -> { next null }
             case reply_thread -> {
               if (reply_thread == prompt_ts) {
-                // Tag the raw `U…` id before it is stored or shown to a model: a workspace's ids
-                // are a small, guessable space, and the keyed tag is the package's sound pseudonym.
-                let tag = slack.author_tag(source = credentials.env(key = "SLACK_BOT_TOKEN"), author = author)
+                // Tag the raw `U…` id before it is stored or shown to a model: a workspace's ids are a
+                // small, guessable space, so the stand-in is KEYED — a bare hash of a guessable value is
+                // reversible by trying the values, and `crypto.pseudonym` is that judgement spelled once.
+                // The key is the bot token, resolved here, so its `io` and its two throws ride this
+                // handler's row out to the root.
+                let tag = crypto.pseudonym(key = credentials.resolve(source = credentials.env(key = "SLACK_BOT_TOKEN")), value = author)
                 next null with { window = collecting(date = date, prompt_ts = prompt_ts, entries = array.append(target = entries, value = entry(author = f"teammate-${tag}", text = text))) }
               } else {
                 next null
@@ -539,13 +558,13 @@ agent main() -> string with io | store.get | store.set {
       match (window) {
         case idle(_) -> { next null with { window = collecting(date = date, prompt_ts = prompt_ts, entries = []) } }
         // Opening a window while one is already open is exactly what a restart produces: this desk is run
-        // state and survives it, while the schedule fiber is forked again and re-opens today's recorded
+        // state and survives it, while the schedule fiber is run again and re-opens today's recorded
         // window. So the same-window arm below is what keeps the morning's replies — and the two arms stay
         // split because each protects a different thing the other would lose.
         case collecting(date => open_date, prompt_ts => open_ts, entries => entries) -> {
           if (open_date == date && open_ts == prompt_ts) {
             // The same window: keep what was collected, so a re-open — a redelivered tick, or a fiber
-            // forked again after a restart — can never discard entries.
+            // run again after a restart — can never discard entries.
             next null
           } else {
             // A different window: replace, so one instance's leftovers can never leak into another
@@ -576,7 +595,9 @@ agent main() -> string with io | store.get | store.set {
       prelude.throw(error = fiber_failure(name = name, detail = json.stringify(value = error)))
     }
   }
-  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = configuration.standup_channel, name = "channel-watcher")
-  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = configuration, name = "standup-schedule")
+  // A fork's @argument@ is the task's whole parameter record, so each of these reads as the call it is
+  // a deferred version of.
+  let _watcher = region.fork(nursery = nursery, task = channel_watcher, argument = { channel = configuration.standup_channel }, name = "channel-watcher")
+  let _schedule = region.fork(nursery = nursery, task = standup_schedule, argument = { configuration = configuration }, name = "standup-schedule")
   region.watch(nursery = nursery)
 }
