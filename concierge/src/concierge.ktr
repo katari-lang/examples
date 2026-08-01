@@ -195,9 +195,12 @@ agent serve(public_channel: string, control_channel: string) -> string {
   }
 
   @"An AI ended, which the route answers by forgetting it and cancelling the channel watcher that
-  belonged to it. Nothing left standing can hire it again — `ai.spawn` is served BY the route and this
-  handler sits above it — so the honest report is that this concierge has gone deaf on that channel, and
-  the run stops at the moment that became true rather than one message later."
+  belonged to it. A RESTART WOULD HAVE TO STAND AT THE ALTITUDE OF WHAT DIED — inside the route's
+  extent, where the region is still alive and a `spawn` reaches the route — and this program
+  deliberately puts none there: a resident's conversation lives in its fiber, so a re-hired face would
+  answer the next message knowing nothing of the last hour. So the honest report is that this concierge
+  has gone deaf on that channel, and the run stops at the moment that became true rather than one
+  message later."
   agent lost_ai(which: string, cause: string) -> never with discord.credential | io | prelude.throw[app_error] {
     operator_note(reply = f"(the ${which} ended — ${cause}. Its conversation is lost and its channel watcher went with it, so the concierge is stopping rather than standing deaf over that channel. The published notes are untouched.)")
     prelude.throw(error = fiber_died(name = which, detail = cause))
@@ -218,11 +221,16 @@ agent serve(public_channel: string, control_channel: string) -> string {
   use ai.with_context(inject = published_notes)
   use ai.with_breaker(on_transition = announce_outage)
 
-  // WHAT A DEATH MEANS, above the route — which is the only place it can be, because the route re-raises
-  // an ending outward AFTER forgetting the AI it belonged to, so this line is true when it is said. The
-  // route's nursery holds three kinds of fiber and the name tag tells them apart: an AI (fatal, above), a
-  // watcher forked beside one (`face/source` — it never crashes, since it supervises itself, and only a
-  // budget it could not keep escapes, as a throw), and a `mail:` fiber carrying one report.
+  // WHAT A DEATH MEANS — and above the route, the business is the REGION's death and not a restart. A
+  // restart goes at the altitude of what died: a `crashed` names a dead FIBER whose region is still
+  // alive, so a policy that re-hires stands INSIDE the route's extent, where a `spawn` reaches the
+  // route. From here, above it, a `spawn` would escalate past the route to the run root and park. What
+  // belongs at THIS altitude is the notice and the stop, and it is also the only place either can be
+  // said truthfully: the route re-raises an ending outward AFTER forgetting the AI it belonged to.
+  // The route's nursery holds three kinds of fiber and the name tag tells them apart: an AI (fatal,
+  // above), a watcher forked beside one (`face/source/0` — one tag per entry of `sources`, so a death
+  // names WHICH watcher; it never crashes, since it supervises itself, and only a budget it could not
+  // keep escapes, as a throw), and a `mail:` fiber carrying one report.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
       match (name) {
