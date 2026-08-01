@@ -19,8 +19,9 @@ it comes back.
 - **AI triage with structured output** — one `ai.infer_structured[T]` call whose object type is the
   contract, converted to a data sum at the boundary:
   [Giving the model tools](https://katari-lang.dev/docs/v0.1/tutorial/giving-the-model-tools).
-- **OAuth credentials and preflight** — the runtime owns the Google tokens; the program names a
-  credential and `credentials.preflight` fails loud at deploy:
+- **OAuth credentials and a boot preflight** — the runtime owns the Google tokens; the program names a
+  credential and a boot check made of `prelude.catch` around `credentials.resolve` fails loud at deploy,
+  naming every unset secret at once instead of stopping at the first:
   [Secrets and credentials](https://katari-lang.dev/docs/v0.1/guides/secrets-and-credentials).
 - **The converter idiom** — a resident source that folds transient poll failures into a durable
   backoff instead of dying:

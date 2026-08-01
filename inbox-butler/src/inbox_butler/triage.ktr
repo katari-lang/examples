@@ -74,8 +74,13 @@ agent triage_mail(message: gmail.message, zone: string) -> triage_outcome with g
     case recorded -> f"raw ${recorded} markup; read the content through the tags"
   }
   // A newsletter-sized mail must cost a bounded prompt, and the cut must SAY so — a silent cut
-  // would let the model answer from a fragment as though it had the whole.
-  let clipped_body = if (string.length(value = body.text) <= 16000) { body.text } else { f"${string.slice(value = body.text, start = 0, end = 16000)}\n… (the mail was cut here at 16000 characters; judge from what is shown)" }
+  // would let the model answer from a fragment as though it had the whole. `string.fit` pays for the
+  // marker out of the budget rather than adding it on top, so the bound really is the bound.
+  let clipped_body = string.fit(
+    value = body.text,
+    cap = 16000,
+    marker = "\n… (the mail was cut here; judge from what is shown)",
+  )
   let prompt = string.join(separator = "\n", parts = [
     "You are the triage step of an inbox butler. Decide whether the mail below asks for, proposes, or confirms a MEETING or APPOINTMENT the operator would plausibly put on their calendar. Fill the object exactly:",
     "- verdict: \"meeting\" when the mail names or clearly implies one concrete occasion; otherwise \"not_meeting\" (then set the other strings to \"\" and duration_minutes to 0).",

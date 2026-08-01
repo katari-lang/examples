@@ -30,9 +30,14 @@ agent butler_timezone() -> string {
 }
 
 @"How often to poll the mailbox, in minutes — the OPTIONAL env `GMAIL_POLL_MINUTES`, default 5.
-Spelled once, because `main` validates the same value the source fiber then polls on."
+Spelled once, because `main` validates the same value the source fiber then polls on. The env plane is
+strings, so the parse lives at the read site: what an unparseable knob should mean is this program's
+judgement, and here it is the default — the same answer an unset entry gets."
 agent gmail_poll_minutes() -> integer {
-  env.get_integer_or(key = "GMAIL_POLL_MINUTES", fallback = 5)
+  match (string.to_integer(value = string.trim(value = env.get_or(key = "GMAIL_POLL_MINUTES", fallback = "")))) {
+    case null -> 5
+    case minutes -> minutes
+  }
 }
 
 // ── the interaction plane: one seam every human question goes through ─────────────────────────────
@@ -57,6 +62,10 @@ and a question the runtime interrupted both become `not_asked`; `auth_error` re-
 stop the butler loudly. The `not_asked` arm cannot hide a broken connection, because there is no connection
 to break: every call carries the bot token, and the socket an ask waits on belongs to that ask alone."
 agent guarded_ask(prompt: string, controls: array[discord.control]) -> ask_outcome with discord.credential | io | prelude.throw[discord.auth_error] {
+  // NOT `prelude.catch`, and the reason is the whole point of this adapter: `catch` folds a THROW into a
+  // value, and the ending this gate must fail closed on is the other one — a runtime restart INTERRUPTS
+  // the ask, which is a panic. `supervise.once` with both converters folds the two endings into one
+  // handle, so a single match below decides what happened to the question.
   match (supervise.once(task = agent () -> discord.answer {
     use supervise.signal_panics[discord.discord_error]()
     use supervise.signal_throws[discord.discord_error]()
@@ -90,7 +99,7 @@ box. Every declared field is present in @values@, so the missing-key arm is the 
 agent kept_text(values: record[string], key: string, fallback: string) -> string {
   match (record.get(target = values, key = key)) {
     case null -> fallback
-    case text -> if (string.is_blank(value = text)) { fallback } else { text }
+    case text -> if (string.trim(value = text) == "") { fallback } else { text }
   }
 }
 
@@ -99,7 +108,7 @@ agent kept_text(values: record[string], key: string, fallback: string) -> string
 agent read_answer(answer: discord.answer) -> decision {
   match (answer) {
     case discord.submitted(id => _, values => values, by => _, display_name => _) -> {
-      if (string.is_blank(value = kept_text(values = values, key = "title", fallback = ""))) {
+      if (string.trim(value = kept_text(values = values, key = "title", fallback = "")) == "") {
         refused(reason = "the operator cleared the title — an emptied draft reads as 'do not create this'")
       } else {
         granted(values = values)
@@ -112,7 +121,8 @@ agent read_answer(answer: discord.answer) -> decision {
 @"Post one line to the butler channel without letting a failed post kill the caller. `dropped` folds
 to null deliberately — this channel IS the reporting surface, so the line has no second audience."
 agent report(text: string) -> null with discord.credential | io | prelude.throw[discord.auth_error] {
-  match (discord.try_send(channel = butler_channel(), text = discord.fit_message(text = text, marker = "… (cut to fit one Discord message)"))) {
+  let bounded = string.fit(value = text, cap = discord.limits().message_text, marker = "… (cut to fit one Discord message)")
+  match (discord.try_send(channel = butler_channel(), text = bounded)) {
     case discord.delivered() -> null
     case discord.dropped(reason => _) -> null
   }
@@ -136,7 +146,7 @@ type bus_ceiling = gate_ceiling | source_ceiling
 @"FORK a gate: run @task@ — one mail's whole question-and-consequence — as a fiber and answer AT ONCE, so the desk keeps triaging while the operator takes their time."
 request spawn_gate(
   @"The gate's fiber name; prefixed `gate:` so a roster line reads as a pending question." name: string,
-  @"The whole gate: ask the operator, then act on exactly what they answered." task: agent (input: null) -> null with gate_ceiling,
+  @"The whole gate: ask the operator, then act on exactly what they answered — nullary, so the fork it becomes is applied to nothing." task: agent () -> null with gate_ceiling,
 ) -> null
 
 @"Create the event EXACTLY as the operator submitted it, answering the one line the channel gets —
@@ -177,7 +187,7 @@ agent create_as_submitted(values: record[string], start_fallback: string, durati
             case resolved -> resolved
           }
           // The calendar package's event carries no location field, so the place rides the description.
-          let location_line = if (string.is_blank(value = location)) { "" } else { f"Location: ${location}\n" }
+          let location_line = if (location == "") { "" } else { f"Location: ${location}\n" }
           let created = google_calendar.create_event(
             calendar_id = env.get_or(key = "CALENDAR_ID", fallback = "primary"),
             summary = title,
@@ -196,10 +206,11 @@ agent create_as_submitted(values: record[string], start_fallback: string, durati
 came back, in one place. A skip is quiet (the operator said no and knows it); an UNPOSTABLE question
 is loud, because that silence would mean events silently never offered."
 agent event_gate(sender: string, subject: string, candidate: triage.event_candidate) -> null with gate_ceiling {
-  let location_note = if (string.is_blank(value = candidate.location)) { "" } else { f" at ${candidate.location}" }
+  let location_note = if (string.trim(value = candidate.location) == "") { "" } else { f" at ${candidate.location}" }
   // The essentials lead and the model's prose trails: a cut never costs the decision its facts.
-  let prompt = discord.fit_message(
-    text = f"Mail from ${sender} — \"${subject}\" looks like it wants a meeting: ${candidate.note}\nProposed: ${candidate.title} — ${candidate.start_rfc3339}, ${string.to_string(value = candidate.duration_minutes)} min${location_note}.\nOpen \"edit & create\" to fix any field before it lands, or skip.",
+  let prompt = string.fit(
+    value = f"Mail from ${sender} — \"${subject}\" looks like it wants a meeting: ${candidate.note}\nProposed: ${candidate.title} — ${candidate.start_rfc3339}, ${string.to_string(value = candidate.duration_minutes)} min${location_note}.\nOpen \"edit & create\" to fix any field before it lands, or skip.",
+    cap = discord.limits().message_text,
     marker = "… (cut; the form holds the full values)",
   )
   let outcome = ask_operator(prompt = prompt, controls = [
@@ -250,7 +261,7 @@ agent handle_mail(message: gmail.message) -> null with spawn_gate | gmail.creden
         // The residual arm is exactly `event_candidate`, bound whole. The gate is a FORK so the
         // desk keeps triaging while this question waits on a human.
         case candidate -> {
-          agent decide(input: null) -> null with gate_ceiling {
+          agent decide() -> null with gate_ceiling {
             event_gate(sender = message.sender, subject = message.subject, candidate = candidate)
           }
           spawn_gate(name = f"gate:mail:${message.id}", task = decide)
@@ -265,8 +276,11 @@ converter idiom AROUND the watch: poll failures — `http.auth_error` included, 
 prescription, since a re-run re-resolves the token and a credential needing a human PARKS on its
 authorize escalation — become `supervise.interrupted`, re-running the watch after a capped backoff.
 The cursor is durable, so a restart delivers the downtime instead of skipping it."
-agent mail_source(input: null) -> null with source_ceiling {
-  use supervise.forever(initial_delay_milliseconds = 5000.0, factor = 2.0, max_delay_milliseconds = 900000.0)
+agent mail_source() -> null with source_ceiling {
+  // Only the FIRST delay is stated: five seconds rather than the default one, because a mailbox that
+  // just refused a poll is rarely ready a second later. The factor and the fifteen-minute ceiling are
+  // the package defaults, and saying them again would only be a place for them to drift.
+  use supervise.forever(initial_delay_milliseconds = 5000.0)
   use handler {
     request prelude.throw(error: http.api_failure | http.fetch_error | json.parse_error) -> never {
       supervise.interrupted(failure = error)
@@ -325,8 +339,9 @@ agent session() -> never with store.get | store.set | io | prelude.throw[unknown
   }
   let nursery = use region.provide[butler_scope, bus_ceiling]
   use handler {
-    request spawn_gate(name: string, task: agent (input: null) -> null with gate_ceiling) {
-      let _handle = region.fork(nursery = nursery, task = task, argument = null, name = name)
+    request spawn_gate(name: string, task: agent () -> null with gate_ceiling) {
+      // A fork's @argument@ is the task's whole parameter record, so a nullary gate is applied to `{}`.
+      let _handle = region.fork(nursery = nursery, task = task, argument = {}, name = name)
       next null
     }
   }
@@ -345,7 +360,7 @@ agent session() -> never with store.get | store.set | io | prelude.throw[unknown
       // re-asking a question the operator may already have answered is worse than saying nothing was asked.
       if (name == source_name) {
         report(text = f"(the mail watch stopped: ${message}. Starting it again — nothing that arrived meanwhile is skipped, the cursor is durable.)")
-        let _replacement = region.fork(nursery = nursery, task = mail_source, argument = null, name = source_name)
+        let _replacement = region.fork(nursery = nursery, task = mail_source, argument = {}, name = source_name)
         next null
       } else {
         next report(text = f"(fiber ${name} crashed: ${message} — that question was not asked; its mail is still in your inbox. The butler keeps running.)")
@@ -361,28 +376,50 @@ agent session() -> never with store.get | store.set | io | prelude.throw[unknown
       }
     }
   }
-  let _source = region.fork(nursery = nursery, task = mail_source, argument = null, name = source_name)
+  let _source = region.fork(nursery = nursery, task = mail_source, argument = {}, name = source_name)
   region.watch(nursery = nursery)
+}
+
+@"PROBE one credential: \"\" when it resolves, else the env key to name in the console line. `resolve`
+states a credential that is not there by THROWING, and `prelude.catch` is what turns that into a value
+this boot can collect — which is the whole reason the check can name every missing secret at once
+instead of stopping at the first. An `oauth.server_error` is a different fact (the token endpoint
+answered badly, which no sentence about unset secrets describes), so it flies on."
+agent unresolved(source: credentials.source) -> string with io | prelude.throw[oauth.server_error] {
+  // The probe DROPS the secret inside its own task and answers `null`, which is what keeps this agent's
+  // answer public: a `match` on a private value taints everything it decides, so a task returning the
+  // resolved string would make the console line private and refuse to be printed.
+  agent resolving() -> null with io | prelude.throw[env.missing_secret | oauth.server_error] {
+    let _secret = credentials.resolve(source = source)
+    null
+  }
+  match (prelude.catch(task = resolving)) {
+    case env.missing_secret(key => key, message => _) -> key
+    case oauth.server_error(message => message) -> prelude.throw(error = oauth.server_error(message = message))
+    case _resolved -> ""
+  }
 }
 
 @"Resolve every required credential in one pass: \"\" when all resolve, else one console line NAMING
 every missing secret at once. The `google` OAuth check is also where an unauthorized credential
 PARKS on its authorize escalation — the browser login happens at deploy, not mid-run."
 agent preflight_credentials() -> string with io | prelude.throw[oauth.server_error] {
-  use handler {
-    request prelude.throw(error: credentials.unresolved | oauth.server_error) -> never {
-      match (error) {
-        case credentials.unresolved(names => names) -> { break f"failed: these required secrets are unset: ${string.join(parts = names, separator = ", ")} — set each with `katari env set <NAME> --secret` (see the README) and run again." }
-        case rest -> { prelude.throw(error = rest) }
-      }
-    }
-  }
-  let _resolved = credentials.preflight(sources = [
+  let sources: array[credentials.source] = [
     credentials.env(key = "DISCORD_TOKEN"),
     credentials.env(key = "ANTHROPIC_API_KEY"),
     credentials.oauth(name = "google"),
-  ])
-  ""
+  ]
+  let missing = for (let source in sources, var names: array[string] = []) {
+    match (unresolved(source = source)) {
+      case "" -> { next with { names = names } }
+      case key -> { next with { names = array.append(target = names, value = key) } }
+    }
+  } then (_sources) { names }
+  if (array.length(target = missing) == 0) {
+    ""
+  } else {
+    f"failed: these required secrets are unset: ${string.join(parts = missing, separator = ", ")} — set each with `katari env set <NAME> --secret` (see the README) and run again."
+  }
 }
 
 @"The one-time liveness probe: post the online line with `send_message` — NOT `try_send` — so a typo'd
