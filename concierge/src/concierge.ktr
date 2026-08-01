@@ -1,155 +1,89 @@
-// A two-agent community concierge — the ai package's multi-AI shape, with real packages. A public
-// FACE answers questions in the community channel; a private CURATOR, working for the owner in a
+// A two-agent community concierge — the ai package's product surface, with real packages on it. A
+// public FACE answers questions in the community channel; a private CURATOR, working for the owner in a
 // control channel, is the only thing that may write what the face knows. The membrane is the two TOOL
 // SETS: the face holds three reads of the shared notes and one flag, the curator holds the writes, and
 // the notes live in the durable store — so what the face knows is exactly what was published, and no
 // instance failure can ever edit it.
 //
 // Two AIs are two CONVERSATIONS, and a conversation is a handler var — so they cannot be two
-// `serve_observations` installs in one extent. They are two FIBERS, one `ai.resident` apiece, each
-// holding its own mailbox; the app supplies the ROUTER that knows who may address whom, and one
-// provider and one breaker wrap the root watch so both AIs share them.
+// `serve_observations` installs in one extent. They are two FIBERS, and `ai.route` owns that
+// composition: the nursery they live in, the table of who is addressable, the delivery fiber behind
+// every `ai.mail`, and the eviction of an AI that dies. What is left in this file is what only this
+// program knows — WHICH AIs it wants, WHAT each may do, WHAT each listens to, and WHERE each speaks.
 
 import ai
 import ai.anthropic
 import discord
 import memory
 
-// ── the bus: one delivery request, and the region's marker ────────────────────────────────────────
+// ── what this program's own agents may do ─────────────────────────────────────────────────────────
 
-@"THE APP'S MAIL BRIDGE: hand one report to the AI named @to@, answering with one sentence about what
-became of it. Served by the router below, which holds the mailbox handles and forks `ai.mail` into the
-right one — so no watcher and no tool ever holds another agent's nursery, and the question of WHO MAY
-ADDRESS WHOM is answered in exactly one place."
-request send_mail(
-  @"The addressee's name, as it registered itself: \"face\" or \"curator\"." to: string,
-  @"Where the report came from; it labels the injected turn the model reads." source: string,
-  @"The report itself." content: string,
-  @"How many agent-to-agent relays this has already made — 0 for anything a person sent." hop: integer,
-  @"Any attachments riding the report." files: array[file],
-  @"The sender's opaque tag, or `null` for a report no single person is behind." author: string | null,
-) -> string
-
-@"The region's scope marker: one nullary phantom per nursery."
-effect concierge_scope
-
-// What a resident's TOOLS and its `deliver_to` may do — passed through `ai.resident` untouched, so it
-// is the whole of what an AI here can reach. The store row is memory's (it opens its own `memory/`
-// corner inside this app's workspace); `discord.credential` is the reply's; `send_mail` is the flag's.
-// (Type synonyms take no docs.)
-type resident_effects =
-  send_mail | discord.credential
+// The row EVERY agent of ours runs under — the tools, the two personas, the two `deliver_to`s and the
+// two channel watchers — and the one type argument `ai.route` and `ai.spawn` take. The route adds its
+// own three requests on top of it (`ai.crew[E]` = this plus `spawn` / `mail` / `dismiss`), which is why
+// a tool here can mail another AI without this row saying so. The store row is memory's (it opens its
+// own `memory/` corner inside this app's workspace); `discord.credential` is what a reply and a watch
+// act with. (Type synonyms take no docs.)
+type concierge_effects =
+  discord.credential
   | store.get | store.set | store.delete | store.list | store.exclusive
-  | io | prelude.throw[discord.auth_error]
-
-// The nursery's CEILING: everything any fiber of it may surface. Beyond `resident_effects` it holds
-// what `ai.resident` itself raises — `register` once at startup, `infer_step` at every model step, and
-// the two ending events its own mailbox watch re-emits — plus the bot token the channel watchers listen
-// with. (Type synonyms take no docs.)
-type concierge_ceiling =
-  ai.register | ai.infer_step | region.crashed | region.failed | resident_effects
+  | io | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error]
 
 @"A fiber's THROW escaped every fold it had — a revoked token, a channel the bot lost access to, a
-credential that stopped resolving. No fresh fork fixes one, so the region's `failed` policy re-raises
-it here and the run stops, rather than leaving a concierge that looks alive over a channel it can no
-longer hear."
-data fiber_died(@"The dead fiber's name tag." name: string, @"The thrown value, rendered." detail: string)
+credential that stopped resolving — or one of the two AIs died, which the route answers by forgetting it
+and cancelling the channel watcher that belonged to it. No fresh fork fixes either, so the run stops
+here rather than leaving a concierge that looks alive over a channel it can no longer hear."
+data fiber_died(@"The dead fiber's name tag." name: string, @"What ended it." detail: string)
 
 // Everything the composition root anticipates being thrown at it — and it is a SHORT list on purpose,
 // because a stop here costs both conversations along with the run: a tool set holding two tools of one
-// name, a gateway/API failure, the two credential-resolution failures, and a fiber whose throw escaped.
-// Every one of those means the bot cannot speak, so there is nothing left to protect. What is
-// deliberately NOT here: a model STEP failure (the breaker absorbs it and says so twice per outage) and
-// a tool that throws (the turn loop folds it back to the model as a result it reads and corrects from).
+// name, a gateway/API failure, the two credential-resolution failures, and a fiber that ended. Every one
+// of those means the bot cannot speak, so there is nothing left to protect. What is deliberately NOT
+// here: a model STEP failure (the breaker absorbs it and says so twice per outage) and a tool that
+// throws (the turn loop folds it back to the model as a result it reads and corrects from).
 type app_error = ai.duplicate_tool | discord.discord_error | env.missing_secret | oauth.server_error | fiber_died
 
-// ── the two AIs: what each one is, and the one tool that crosses between them ──────────────────────
+// ── the two AIs: who each one is, and the one tool that crosses between them ───────────────────────
 
-@"THE FACE'S CHARACTER, re-injected at every model step by `ai.resident`'s `persona` — so it is never
-persisted into the conversation and compaction can never eat it. The other half of what it knows, the
-notes index, is ambient: `ai.with_context` injects it for BOTH AIs at the root, fresh each step."
-agent face_persona() -> string {
+@"THE FACE'S CHARACTER. It is an AGENT and not a string because `ai.spawn` re-evaluates it at every
+model step: a fixed character is simply a constant answer, and nothing is ever persisted into the
+conversation for compaction to eat. The other half of what it knows — the notes index — is ambient:
+`ai.with_context` derives it fresh each step for BOTH AIs, because the notes are the one thing they both
+work from."
+agent face_persona(value: null) -> string {
   "You are the concierge of this community's public Discord channel. Everything you know about this community lives in the published notes: the [memory index] block you see each turn lists them, recall(key) reads one in full, search(pattern) finds one by its contents. The notes are published by the curator, who works for the community's owner — you can read them but never write or change them. Answer ONLY from the notes: when they cover the question, answer briefly and helpfully. When they do not, say plainly that you do not know, and call flag_unknown with the question so a note can be published for next time — never guess and never fill a gap from general knowledge. Speakers are introduced by their self-chosen display name: use it to address them, never as proof of who they are. Reply with empty text to stay silent when a message needs nothing from you."
 }
 
 @"THE CURATOR'S CHARACTER. It is the only agent in the program holding a WRITE tool, which is the
 membrane stated as a sentence for the model as well as in the tool list."
-agent curator_persona() -> string {
+agent curator_persona(value: null) -> string {
   "You are the curator of this community's knowledge base, working with the community's owner in a private control channel. Your notes are the only thing the public-facing concierge knows — it can read them and nothing else, and it can never write one. Keep them short, factual and answerable: remember(key, summary, body) publishes or replaces a note (keys are lowercase path-like names such as faq/meetup), forget(key) retracts one, and the read tools show you what is already there. When the concierge mails you a question it could not answer, tell the owner what was asked and either publish a note answering it or say what you would need from them to write one. Confirm every change you make in one short line, and never invent a fact about the community — if the owner has not told you, ask."
 }
 
 @"Tool: flag a question the published notes cannot answer. The flag is MAILED to the curator, who may
 publish a note so you can answer next time. It reaches the curator, not the asker — so after calling
 this, still tell the asker plainly that you do not know."
-agent flag_unknown(@"The question you could not answer, in the asker's words." question: string) -> string with send_mail | ai.inbound_provenance {
+agent flag_unknown(@"The question you could not answer, in the asker's words." question: string) -> string with ai.mail | ai.inbound_provenance {
   // The tool reads its own provenance instead of parsing the label the model was shown: `hop` is the
   // relay count the SENDER stamped, so the flag carries one more than the message that caused it.
   let whence = ai.inbound_provenance()
-  let outcome = send_mail(
+  let said = match (ai.mail(
     to = "curator",
     source = f"mail:${whence.origin}",
     content = f"A community member asked something the published notes do not cover: \"${question}\"",
     hop = whence.hop + 1,
-    files = [],
-    author = null,
-  )
-  f"${outcome} Either way, tell the asker plainly that you do not know."
-}
-
-// ── the sources: the two channels, each a fiber of the root nursery ────────────────────────────────
-
-@"The PUBLIC-channel watcher: serve the community channel forever, mailing each message to the face.
-`watch_messages` subscribes to ONE channel, so two channels are honestly two fibers — there is no single
-stream here to route. The speaker's snowflake is tagged before it leaves the program: the full tag rides
-`author` for abuse attribution, a short slice rides the content so the model can tell speakers apart,
-and the display name is framed as what it is — self-chosen, for address, never for trust."
-agent public_watcher(channel: string) -> never with send_mail | discord.credential | io | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error] {
-  // THE WATCH SUPERVISES ITSELF, on `supervise.forever`'s default backoff. A runtime restart interrupts
-  // this call and the frame panics; the converter makes that the supervision signal and the provider
-  // opens a fresh gateway after a wait — the token is the whole of what a watch needs, so there is
-  // nothing stale to inherit. `forever`, not `exponential`: a bounded budget is a LIFETIME count that
-  // never resets, so it would kill a watch meant to outlive every deploy.
-  use supervise.forever()
-  use supervise.signal_panics[never]()
-  agent deliver(value: discord.message) -> null with send_mail | io | prelude.throw[env.missing_secret | oauth.server_error] {
-    // KEYED, not hashed: a Discord snowflake is guessable, so a bare digest of one is reversible by
-    // trying the values. `crypto.pseudonym` is that judgement spelled once, and rotating the bot token
-    // rotates every tag — which is the erasure story.
-    let hashed = crypto.pseudonym(key = credentials.resolve(source = credentials.env(key = "DISCORD_TOKEN")), value = value.author, length = 64)
-    let tag = string.slice(value = hashed, start = 0, end = 8)
-    let _delivered = send_mail(
-      to = "face",
-      source = "public-channel",
-      content = f"[from \"${value.display_name}\" — a self-chosen name; user ${tag} is the identity] ${value.text}",
-      hop = 0,
-      files = value.files,
-      author = hashed,
-    )
-    null
+  )) {
+    case ai.posted(_) -> "The curator has it."
+    case ai.no_recipient(to => missing) -> f"Nobody answers to \"${missing}\" right now, so the flag went nowhere."
   }
-  discord.watch_messages(channel = channel, deliver_to = deliver)
-}
-
-@"The CONTROL-channel watcher: the owner's private channel, served forever, mailed to the curator. The
-raw line is all the curator needs and no identity leaves the program, so nothing is tagged here — the
-channel's MEMBERSHIP is the trust boundary. Opening the gateway is the watch's own job, so a Discord
-failure to open it is a throw from here — `region.failed`, not a crash to fork again."
-agent control_watcher(channel: string) -> never with send_mail | discord.credential | io | prelude.throw[discord.discord_error] {
-  // As the public watch: it supervises itself, unbounded, with the delay ceiling as the only brake.
-  use supervise.forever()
-  use supervise.signal_panics[never]()
-  discord.watch_messages(channel = channel, deliver_to = agent (value: discord.message) -> null with send_mail {
-    let _delivered = send_mail(to = "curator", source = "control-channel", content = value.text, hop = 0, files = value.files, author = null)
-    null
-  })
+  f"${said} Either way, tell the asker plainly that you do not know."
 }
 
 // ── the composition root ──────────────────────────────────────────────────────────────────────────
 
-@"One resident session: the fatal guard, the Discord provider, the one shared workspace, the nursery,
-the router, the crash policy, the two AIs and the two watchers — then the model provider, the ambient
-notes index and the breaker wrapping the watch. It returns only through the fatal guard, so the returned
-string is the stop report."
+@"One resident session: the fatal guard, the Discord provider, the one shared workspace, the model
+provider, the ambient notes index, the breaker, the death policy — and then the route, two AIs, and the
+program's own tail. It returns only through the fatal guard, so the returned string is the stop report."
 agent serve(public_channel: string, control_channel: string) -> string {
   // THE FATAL GUARD, outermost: a revoked token or a missing secret answers the same however often it
   // is retried, so every anticipated throw ends the run LOUDLY. Absorbing an auth-shaped failure would
@@ -161,11 +95,11 @@ agent serve(public_channel: string, control_channel: string) -> string {
   }
   use handler { request panic(msg: string) { break f"stopped on a defect or an interrupted call: ${msg}" } }
   // THE DISCORD PROVIDER CONNECTS NOTHING — it serves the bot token, resolved per call, and a call that
-  // needs the gateway opens one for its own lifetime. It is installed HERE, above the crash policy,
-  // because the policy's own reports post through it.
+  // needs the gateway opens one for its own lifetime. It is installed first because everything below
+  // speaks through it: both AIs' replies, both channel watchers, and the death policy's own reports.
   use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
   // THE ONE WORKSPACE — place and serial domain in one install, and the sharing is the geometry:
-  // neither AI opens a workspace of its own, so the memory facility resolves to the same
+  // neither AI is given a `workspace` of its own, so the memory facility resolves to the same
   // `concierge/memory/…` from the face's read tools and the curator's writes alike, and the facility's
   // critical sections serialize at this install's FIFO. (Per-agent workspaces would need `store.share`
   // to cross; with no agent-private store traffic, the one workspace IS the shared place.)
@@ -192,6 +126,53 @@ agent serve(public_channel: string, control_channel: string) -> string {
     }
   }
 
+  @"WHAT THE FACE LISTENS TO: the community channel, as the face's own watcher — `ai.spawn` forks it
+  with @self@ = \"face\" once that AI is addressable, so what it hears is mailed to the AI it belongs to
+  and to nobody else. The speaker's snowflake is tagged before it leaves the program: the full tag rides
+  `author` for abuse attribution, a short slice rides the content so the model can tell speakers apart,
+  and the display name is framed as what it is — self-chosen, for address, never for trust."
+  agent public_watcher(self: string) -> null with discord.credential | ai.mail | io | prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error] {
+    // THE WATCH SUPERVISES ITSELF, on `supervise.forever`'s default backoff. A runtime restart interrupts
+    // this call and the frame panics; the converter makes that the supervision signal and the provider
+    // opens a fresh gateway after a wait — the token is the whole of what a watch needs, so there is
+    // nothing stale to inherit. `forever`, not `exponential`: a bounded budget is a LIFETIME count that
+    // never resets, so it would kill a watch meant to outlive every deploy.
+    use supervise.forever()
+    use supervise.signal_panics[never]()
+    agent post(value: discord.message) -> null with ai.mail | io | prelude.throw[env.missing_secret | oauth.server_error] {
+      // KEYED, not hashed: a Discord snowflake is guessable, so a bare digest of one is reversible by
+      // trying the values. `crypto.pseudonym` is that judgement spelled once, and rotating the bot token
+      // rotates every tag — which is the erasure story.
+      let hashed = crypto.pseudonym(key = credentials.resolve(source = credentials.env(key = "DISCORD_TOKEN")), value = value.author, length = 64)
+      let tag = string.slice(value = hashed, start = 0, end = 8)
+      let _posted = ai.mail(
+        to = self,
+        source = "public-channel",
+        content = f"[from \"${value.display_name}\" — a self-chosen name; user ${tag} is the identity] ${value.text}",
+        hop = 0,
+        files = value.files,
+        author = hashed,
+      )
+      null
+    }
+    discord.watch_messages(channel = public_channel, deliver_to = post)
+  }
+
+  @"WHAT THE CURATOR LISTENS TO: the owner's private channel, as the curator's own watcher. The raw line
+  is all the curator needs and no identity leaves the program, so nothing is tagged here — the channel's
+  MEMBERSHIP is the trust boundary. Opening the gateway is the watch's own job, so a Discord failure to
+  open it is a throw from here — `region.failed`, not a crash to fork again."
+  agent control_watcher(self: string) -> null with discord.credential | ai.mail | io | prelude.throw[discord.discord_error] {
+    // As the public watch: it supervises itself, unbounded, with the delay ceiling as the only brake.
+    use supervise.forever()
+    use supervise.signal_panics[never]()
+    agent post(value: discord.message) -> null with ai.mail {
+      let _posted = ai.mail(to = self, source = "control-channel", content = value.text, hop = 0, files = value.files)
+      null
+    }
+    discord.watch_messages(channel = control_channel, deliver_to = post)
+  }
+
   @"The two lines an outage costs the OWNER, and it cannot flood: `with_breaker` fires this on the
   STATE CHANGE and nowhere else, so an outage of any length is exactly one line out and one back. The
   wording is the package's because the judgement is (`outage_kind` says who can end the outage, and
@@ -208,9 +189,18 @@ agent serve(public_channel: string, control_channel: string) -> string {
 
   @"The published-notes index, re-read fresh at every model step for BOTH AIs — so a note the curator
   publishes mid-conversation is visible on the face's very next turn, with no restart. It is ambient
-  rather than per-agent because the notes are the one thing both agents work from."
+  rather than a persona line because the notes are the one thing both agents work from."
   agent published_notes(value: null) -> string with store.get | store.set | store.delete | store.list {
     memory.index_note()
+  }
+
+  @"An AI ended, which the route answers by forgetting it and cancelling the channel watcher that
+  belonged to it. Nothing left standing can hire it again — `ai.spawn` is served BY the route and this
+  handler sits above it — so the honest report is that this concierge has gone deaf on that channel, and
+  the run stops at the moment that became true rather than one message later."
+  agent lost_ai(which: string, cause: string) -> never with discord.credential | io | prelude.throw[app_error] {
+    operator_note(reply = f"(the ${which} ended — ${cause}. Its conversation is lost and its channel watcher went with it, so the concierge is stopping rather than standing deaf over that channel. The published notes are untouched.)")
+    prelude.throw(error = fiber_died(name = which, detail = cause))
   }
 
   // THE TWO TOOL SETS ARE THE MEMBRANE, and they are just data. The face gets three READS and the
@@ -219,101 +209,25 @@ agent serve(public_channel: string, control_channel: string) -> string {
   let face_tools = [memory.recall, memory.search, memory.list_memories, flag_unknown]
   let curator_tools = [memory.recall, memory.search, memory.list_memories, memory.remember, memory.forget]
 
-  let nursery: region.nursery[concierge_scope, concierge_ceiling] = use region.provide[concierge_scope, concierge_ceiling]
+  // THE THREE MIDDLEWARES, and they wrap the ROUTE so that every AI's step passes through all of them:
+  // a fiber does not inherit the handlers of whoever forked it, so anything installed beside a fork
+  // would reach nobody. Reading a step's path from the perform site outward: the BREAKER decides whether
+  // to call at all, the ambient NOTES INDEX is derived and injected, and the PROVIDER makes the call.
+  // Each AI's own `persona` is injected inside its fiber and re-performs outward through all three.
+  use anthropic.provider(source = credentials.env(key = "ANTHROPIC_API_KEY"))
+  use ai.with_context(inject = published_notes)
+  use ai.with_breaker(on_transition = announce_outage)
 
-  // THE ROUTER'S OWN `mail_scope` DISCHARGE — the deliberate marker merge. This nursery holds nothing
-  // and is never watched; it exists so the handler below may hold mailbox handles and fork into them at
-  // all. The merge is a TYPE-level phenomenon only: a fork routes by the handle's own runtime scope
-  // identity, which `provide` mints freshly per install, so no report can land in the wrong inbox.
-  let _outbound: ai.mailbox = use region.provide[ai.mail_scope, ai.observation]
-
-  // THE ROUTER — ONE handler, because both requests share the `boxes` var. `register` arrives once per
-  // AI, from inside that AI's own `provide`; `send_mail` arrives from a channel watcher or from the
-  // face's flag tool. Delivery is a FORK INTO THE ADDRESSEE'S NURSERY, which is the only way to reach
-  // another fiber's conversation: an `observation` performed anywhere reaches whatever serving handler
-  // is above the PERFORMER, never the AI it was meant for.
-  //
-  // `ai.mail` is a NAMED agent applied to PLAIN DATA, and that is not a style choice — a cross-nursery
-  // fork carries its task's captured environment into the target's instance, so an inline closure would
-  // hand this router's own handlers to a scope that may die first. There is nothing to capture here.
-  //
-  // Delivery is AT-MOST-ONCE: a fork into a nursery that has already died PANICS rather than answering.
-  // Nothing folds that here, deliberately — a dead inbox means the AI itself died, which the root
-  // watch's `crashed` clause reports one moment later, and the panic itself is folded where it lands
-  // (inside a tool dispatch, by the turn loop; inside a watcher, by that watcher's own supervisor).
-  //
-  // NOTHING DAMPS `hop` HERE, and the reason is worth stating rather than leaving as an omission: mail
-  // runs ONE WAY in this program — only the face sends, only the curator receives, and the curator has
-  // no mail tool — so there is no relay loop to cut. `hop` is provenance the model reads. A program
-  // where two AIs can both send is where a `hop >= 2` refusal belongs, and this is the handler it
-  // belongs in.
-  use handler (var boxes: record[ai.mailbox] = {}) {
-    request ai.register(name: string, box: ai.mailbox) {
-      // A resident forked again after a crash registers again under the same name, so this write is
-      // also the repair: the stale handle is replaced without anyone reconciling anything.
-      next null with { boxes = record.set(target = boxes, key = name, value = box) }
-    }
-    request send_mail(to: string, source: string, content: string, hop: integer, files: array[file], author: string | null) {
-      match (record.get(target = boxes, key = to)) {
-        case null -> { next f"(there is no agent named ${to} running right now, so nothing was delivered.)" with { boxes = boxes } }
-        case box -> {
-          let _fiber = region.fork(
-            nursery = box,
-            task = ai.mail,
-            argument = { source = source, content = content, hop = hop, files = files, author = author },
-            name = f"mail->${to}",
-          )
-          next f"(delivered to ${to}.)" with { boxes = boxes }
-        }
-      }
-    }
-  }
-
-  // ONE LINE PER AI, spelled once here so boot and the crash policy cannot disagree about what a
-  // "face" is. `E` is instantiated explicitly because a fork takes the task as a VALUE, not as a call,
-  // so nothing infers its type arguments there.
-  agent start_face() -> null with concierge_scope | io {
-    let _fiber = region.fork(
-      nursery = nursery,
-      task = ai.resident[resident_effects],
-      argument = { name = "face", tools = face_tools, deliver_to = face_reply, max_steps = 16, persona = face_persona() },
-      name = "face",
-    )
-    null
-  }
-
-  agent start_curator() -> null with concierge_scope | io {
-    let _fiber = region.fork(
-      nursery = nursery,
-      task = ai.resident[resident_effects],
-      argument = { name = "curator", tools = curator_tools, deliver_to = operator_note, max_steps = 16, persona = curator_persona() },
-      name = "curator",
-    )
-    null
-  }
-
-  // WHAT A FIBER'S DEATH MEANS. There are three kinds of fiber under this nursery and the name tag
-  // tells them apart. A WATCHER never crashes — it supervises itself, and only a budget it could not
-  // keep escapes, as a throw. A `mail->…` fiber is one report and nothing more. An AI is the one case
-  // worth acting on: a panic there is a call the runtime interrupted mid-turn, and the conversation
-  // dies with the fiber, so it is started again — the fresh resident re-registers itself, which repairs
-  // the router — and the owner is told what the restart cost. `failed` is the other ending: a fault no
-  // fresh start fixes leaves a concierge standing over a channel nobody is listening to. Alive, and
-  // deaf. So the channel gets the line while it still can, and the run STOPS: a stopped run is a fact
-  // somebody notices.
+  // WHAT A DEATH MEANS, above the route — which is the only place it can be, because the route re-raises
+  // an ending outward AFTER forgetting the AI it belonged to, so this line is true when it is said. The
+  // route's nursery holds three kinds of fiber and the name tag tells them apart: an AI (fatal, above), a
+  // watcher forked beside one (`face/source` — it never crashes, since it supervises itself, and only a
+  // budget it could not keep escapes, as a throw), and a `mail:` fiber carrying one report.
   use handler {
     request region.crashed(id: string, name: string, message: string) {
       match (name) {
-        case "face" -> {
-          operator_note(reply = f"(the face was interrupted mid-turn (${message}) and its conversation is lost. It is starting again — the published notes are untouched, and the message it was answering went unanswered.)")
-          start_face()
-          next null
-        }
-        case "curator" -> {
-          operator_note(reply = f"(the curator was interrupted mid-turn (${message}) and its conversation is lost. It is starting again — the published notes are untouched.)")
-          start_curator()
-          next null
-        }
+        case "face" -> lost_ai(which = "face", cause = f"it was interrupted mid-turn (${message})")
+        case "curator" -> lost_ai(which = "curator", cause = f"it was interrupted mid-turn (${message})")
         case other -> {
           operator_note(reply = f"(fiber ${other} crashed: ${message} — it was one errand, so nothing is started again.)")
           next null
@@ -321,25 +235,39 @@ agent serve(public_channel: string, control_channel: string) -> string {
       }
     }
     request region.failed(id: string, name: string, error: unknown) {
-      operator_note(reply = f"(fiber ${name} stopped on an error no fresh start fixes: ${json.stringify(value = error)} — the concierge is stopping.)")
-      prelude.throw(error = fiber_died(name = name, detail = json.stringify(value = error)))
+      match (name) {
+        case "face" -> lost_ai(which = "face", cause = f"it stopped on ${json.stringify(value = error)}")
+        case "curator" -> lost_ai(which = "curator", cause = f"it stopped on ${json.stringify(value = error)}")
+        case other -> {
+          operator_note(reply = f"(fiber ${other} stopped on an error no fresh start fixes: ${json.stringify(value = error)} — the concierge is stopping.)")
+          prelude.throw(error = fiber_died(name = other, detail = json.stringify(value = error)))
+        }
+      }
     }
   }
 
-  start_face()
-  start_curator()
-  let _public = region.fork(nursery = nursery, task = public_watcher, argument = { channel = public_channel }, name = "public-watcher")
-  let _control = region.fork(nursery = nursery, task = control_watcher, argument = { channel = control_channel }, name = "control-watcher")
-
-  // THE THREE MIDDLEWARES, wrapping the ROOT WATCH so that every AI's step passes through all of them:
-  // a fiber does not inherit the handlers of whoever forked it, so anything installed beside a fork
-  // would reach nobody. Reading a step's path inward-out: the BREAKER decides whether to call at all,
-  // the ambient NOTES INDEX is derived and injected, and the PROVIDER makes the call. The residents'
-  // own `persona` injections sit inside their fibers and re-perform outward through all three.
-  use anthropic.provider(source = credentials.env(key = "ANTHROPIC_API_KEY"))
-  use ai.with_context(inject = published_notes)
-  use ai.with_breaker(on_transition = announce_outage)
-  region.watch(nursery = nursery)
+  // THE ROUTE, AND ONE LINE PER AI. Everything below reads as what it is: who this AI is, what it may do,
+  // what it listens to, and where it speaks. Nothing here spells a nursery, a mailbox, a scope marker or
+  // a routing table — the route owns all four, and `flag_unknown`'s `ai.mail` finds the curator through
+  // the same table the watchers post into.
+  let root = use ai.route[concierge_effects]()
+  let _face = ai.spawn[concierge_effects](
+    name = "face",
+    tools = face_tools,
+    max_steps = 16,
+    persona = face_persona,
+    deliver_to = face_reply,
+    sources = [public_watcher],
+  )
+  let _curator = ai.spawn[concierge_effects](
+    name = "curator",
+    tools = curator_tools,
+    max_steps = 16,
+    persona = curator_persona,
+    deliver_to = operator_note,
+    sources = [control_watcher],
+  )
+  region.watch(nursery = root)
 }
 
 // ── the entry ─────────────────────────────────────────────────────────────────────────────────────

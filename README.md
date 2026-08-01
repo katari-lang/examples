@@ -13,7 +13,7 @@ the tutorial ends, and each README says which guides it puts to work.
 | --- | --- | --- |
 | [`release-watch`](release-watch/) | A GitHub release monitor you manage from Discord | Durable scheduling, the desired-set (fleet) pattern, store cursors, folding HTTP failures without dying |
 | [`standup-scribe`](standup-scribe/) | A Slack standup bot with a human-approved digest | Message plane vs interaction plane, ask controls, approval before posting, scheduled jobs with timezones |
-| [`concierge`](concierge/) | A two-agent Discord community concierge | Several AIs as fibers, a router and cross-nursery mail, a capability membrane made of two tool lists |
+| [`concierge`](concierge/) | A two-agent Discord community concierge | Several AIs on one route, one `ai.spawn` per AI, mail between them, a capability membrane made of two tool lists |
 | [`inbox-butler`](inbox-butler/) | Gmail triage that proposes calendar events for one-click approval | OAuth credentials and a boot preflight, AI triage with structured output, the approval-gate idiom |
 
 All four are **residents**: long-running programs that stay on a channel or a schedule rather than
@@ -31,7 +31,7 @@ open question, a conversation that was mid-turn). The rule is
 under it is in [Durable execution](https://katari-lang.dev/docs/v0.1/concepts/durable-execution).
 
 Reading order: `release-watch` (no model, the durable skeleton alone) → `standup-scribe` (one model
-step, one approval gate) → `concierge` (two AIs, a router, cross-nursery mail) → `inbox-butler`
+step, one approval gate) → `concierge` (two AIs on one route, mail between them) → `inbox-butler`
 (multi-provider composition). `concierge` is where the
 [tutorial](https://katari-lang.dev/docs/v0.1/tutorial/a-discord-bot) sends you after its last chapter,
 so it is the shortest step up from there.

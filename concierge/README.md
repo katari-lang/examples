@@ -10,17 +10,18 @@ crosses the membrane.
 
 ## What this example teaches
 
-- **Several AIs as a region composition** — two `ai.resident` fibers, one per conversation, reaching
-  each other by forking `ai.mail` into each other's mailboxes. Adding a third AI here is one line:
-  [the ai package's *Several AIs*](https://katari-lang.dev/packages/ai) and
-  [A second agent](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent).
-- **The router is the app's, and it is one handler.** Who may address whom is a judgement no package
-  can make for you — a fixed pair, a broadcast, a hop limit — so `register` and the app's `send_mail`
-  share one `var record[ai.mailbox]` and about ten lines:
+- **Several AIs, one line apiece** — `use ai.route()` opens the place they live in, and `ai.spawn` hires
+  one per line: its name, its tools, its persona, what it listens to and where it speaks. Adding a third
+  AI here is one more `ai.spawn`: [the ai package's *Several AIs*](https://katari-lang.dev/packages/ai)
+  and [A second agent](https://katari-lang.dev/docs/v0.1/tutorial/a-second-agent).
+- **What the route absorbs, so the program never spells it**: the nursery, its effect ceiling, the
+  `record[mailbox]` table, the `register` handshake, the `mail_scope` franking, the delivery fork per
+  message and the eviction of a dead AI. This example used to hand-roll every one of those — about a
+  hundred lines — and none of them was a fact about *this community*:
   [Handler geometry](https://katari-lang.dev/docs/v0.1/guides/handler-geometry).
 - **Handler geometry**, in the one arrangement multi-AI forces: the provider, the ambient notes index
-  and the breaker wrap the **root watch**, because a fiber does not inherit the handlers of whoever
-  forked it — anything installed beside a fork reaches nobody.
+  and the breaker wrap the **route**, because a fiber does not inherit the handlers of whoever forked
+  it — anything installed beside a fork reaches nobody.
 - **A capability membrane in miniature** — the two tool lists *are* the boundary: the face holds three
   reads of the shared notes plus a flag, the curator holds the same reads plus the two writes. Compare
   the full-size version in [tsukasa](https://github.com/yukikurage/discord-bot-example), whose public
@@ -123,24 +124,24 @@ them is the conversation.
 
 Everything is one file, [`src/concierge.ktr`](src/concierge.ktr), and it is the shape the
 [ai package's *Several AIs*](https://katari-lang.dev/packages/ai) section prescribes, with real
-packages on the bus.
+packages on the bus. Read the last dozen lines first: they are the whole program.
 
-- **Two `ai.resident` fibers**, forked into one root nursery. `ai.resident` is one AI's whole body —
-  its own mailbox nursery, the `register` that announces it, its persona injected at every model step,
-  its `serve_observations`, and the mailbox's own watch. Adding an AI is one `region.fork`; the two here
-  differ only in their name, their persona, their tool set and where their replies go.
-- **Two channel watchers** (`public_watcher`, `control_watcher`), also fibers, each serving one channel
-  with `discord.watch_messages`. They do not perform `ai.observation` — a report performed in a watcher
-  would reach whatever serving handler is above the *watcher*, which is nobody. They perform the app's
-  `send_mail` instead. The public watcher tags each speaker's snowflake into a keyed pseudonym
-  (`crypto.pseudonym` under the bot token) before it leaves the program, and frames the display name as
-  self-chosen — address, never trust.
-- **The router** is one handler holding a `var record[ai.mailbox]`, serving both `ai.register` (an AI
-  announcing its inbox) and `send_mail` (anyone addressing one). Delivery is a **fork into the
-  addressee's nursery**: `region.fork` routes by the handle alone, so the fiber lands under the
-  addressee's `serve_observations` whatever context performed the fork. The task is `ai.mail`, a named
-  agent applied to plain data — never an inline closure, because a cross-nursery fork carries its task's
-  captured environment into a scope that may die first.
+- **`let root = use ai.route[concierge_effects]()`** opens the place the AIs live in and serves the
+  three requests over it — `ai.spawn`, `ai.mail`, `ai.dismiss`. `concierge_effects` is the one type
+  argument: the row *this program's* own agents run under, and the route adds its own three requests on
+  top of it. Nothing in this file names a nursery, a scope marker, an effect ceiling or a mailbox.
+- **Two `ai.spawn` calls, and each parameter is a fact about the community.** `name` is how mail
+  addresses it; `tools` is the whole of what it may do; `persona` is who it is, re-derived at every model
+  step (an *agent*, so a fixed character is just a constant answer); `deliver_to` is where its words go;
+  `sources` is what it listens to. The two AIs differ in exactly those five things.
+- **Each channel watcher belongs to an AI**, as one of its `sources` — forked with `self` = that AI's
+  name once it is addressable, so a watcher cannot post into a void, and `ai.mail(to = self, …)` is how
+  what it hears becomes a turn of that AI's conversation and nobody else's. The public watcher tags each
+  speaker's snowflake into a keyed pseudonym (`crypto.pseudonym` under the bot token) before it leaves
+  the program, and frames the display name as self-chosen — address, never trust.
+- **`ai.mail` is the whole bus.** `flag_unknown` performs it to reach the curator; each watcher performs
+  it to reach its own AI. The route does the table lookup and the fork into the addressee's mailbox, so
+  no watcher and no tool ever holds another agent's nursery.
 - **The two tool sets are the membrane**, and they are just data. Face:
   `[memory.recall, memory.search, memory.list_memories, flag_unknown]`. Curator: the same three reads
   plus `memory.remember` and `memory.forget`. No write reaches the face, and neither AI holds a channel
@@ -148,11 +149,15 @@ packages on the bus.
 - **`flag_unknown`** is the one tool that crosses between them. It reads `ai.inbound_provenance()` —
   the `source` and `hop` of the observation being served — rather than parsing the label the model was
   shown, and mails the question to the curator at one hop more than it arrived with.
-- **Three middlewares wrap the root watch**, because a fiber does not inherit the handlers of whoever
-  forked it: `anthropic.provider`, then `ai.with_context(inject = published_notes)` — the notes index,
+- **Three middlewares wrap the route**, because a fiber does not inherit the handlers of whoever forked
+  it: `anthropic.provider`, then `ai.with_context(inject = published_notes)` — the notes index,
   re-derived fresh at every model step for *both* AIs, because it is the one thing they both work from
   — then `ai.with_breaker`. Reading a step's path from the perform site outward: the breaker decides
-  whether to call at all, the index is injected, the provider calls.
+  whether to call at all, the index is injected, the provider calls. None of the three serializes: each
+  is a parallel handler, so the two AIs' model calls overlap instead of taking turns.
+- **The death policy sits above the route**, which is the only place it can be: the route re-raises an
+  ending *after* forgetting the AI it belonged to, so a handler below that line never sees one and a
+  handler above it can say something true.
 - **The store** is one `store.workspace(path = "concierge")` above everything, so the memory facility
   resolves to the same `concierge/memory/…` from the face's reads and the curator's writes alike, and
   its critical sections serialize at that one install's FIFO.
@@ -170,19 +175,27 @@ Failure discipline:
   curator's `memory.forget` needs no guard here for the one throw it has: a note stored in a shape this
   build cannot read comes back to the curator as an error, and the curator tells you.
 - **What stops the run is a short list, and it is short on purpose**: a tool set holding two tools of
-  one name, a Discord gateway/API failure, the two credential-resolution failures, and a fiber whose
-  throw escaped. Every one means the bot cannot speak.
+  one name, a Discord gateway/API failure, the two credential-resolution failures, and either AI
+  ending. Every one means the bot cannot speak.
 
 Honesty notes:
 
-- **A conversation is a fiber's own state, and a restart that lands mid-turn takes it.** Everything a
-  resident holds — its history, its backlog — lives inside its fiber. A runtime restart between turns
-  costs nothing: nothing external is in flight, and the run resumes from committed state. A restart
-  *during* a turn interrupts the model call, which panics, which ends the fiber: the crash policy starts
-  that AI again (the fresh resident re-registers itself, which is also what repairs the router's handle)
-  and the control channel gets one line saying the conversation was lost. **The published notes are
-  never at risk either way** — they live in the durable store, which no crash edits, and they are the
-  only thing here that is supposed to outlive a conversation.
+- **A conversation is a fiber's own state, and a restart that lands mid-turn takes it — and takes the
+  run with it.** Everything a resident holds — its history, its backlog — lives inside its fiber. A
+  runtime restart between turns costs nothing: nothing external is in flight, and the run resumes from
+  committed state. A restart *during* a turn interrupts the model call, which panics, which ends the
+  fiber. The route then forgets that AI and cancels the channel watcher forked beside it, so the
+  concierge has gone deaf on that channel; the control channel gets one line saying so and the run
+  **stops**, because a bot that looks alive over a channel it cannot hear is the worse ending. Start it
+  again with `katari run concierge.main`. **The published notes are never at risk either way** — they
+  live in the durable store, which no crash edits, and they are the only thing here that is supposed to
+  outlive a conversation.
+- **Re-hiring a dead AI is not written here, and the reason is structural.** `ai.spawn` is served *by*
+  the route, and the death policy sits *above* it — so a `spawn` performed from that handler does not
+  reach the route at all; it escalates to the run root and parks. A program that wants an AI to come back
+  by itself puts a second `region.crashed` handler *inside* the route's extent, re-performs the event
+  outward (so the route evicts first) and hires it again there. This example prefers the shorter,
+  louder ending.
 - **Messages can be missed.** Discord's gateway has no per-event acknowledgement, so across a
   reconnect or a runtime restart a channel message can be missed (and, rarely, repeated) — the
   concierge does not reconcile against channel history. The gap around a restart is the seconds
@@ -197,15 +210,17 @@ Honesty notes:
   start dropping those very lines (`try_send` folds a drop to nothing), so the channel goes quiet under
   exactly the failure it would have to show. `katari status <run>` and its events are the record that
   does not thin out.
-- **Mail is at-most-once, and nothing here folds the loss.** A fork into a nursery whose AI has already
-  died panics rather than answering an error. That panic is folded wherever it lands — inside a tool
-  dispatch by the turn loop, inside a watcher by that watcher's own supervisor — and the root watch's
-  `crashed` clause reports the AI's death one moment later, which is the same news. A program where a
-  lost message must be noticed at the *sender* folds it with `supervise.once` + `signal_panics` at the
-  router.
+- **Mail is at-most-once, and the route says so honestly.** Delivery is a fork into the addressee's
+  mailbox, and a fork into one that has already died panics; the route folds that panic, answers
+  `no_recipient(to)` and forgets the entry on the spot, so the next send fails fast instead of retrying
+  into a grave. `flag_unknown` shows the caller's half: it tells the model the flag went nowhere rather
+  than claiming it was filed. A *handoff* is all a `posted()` ever means — the report becomes a turn when
+  the addressee's serving handler gets to it.
 - **Nothing damps `hop`.** Mail runs one way here — only the face sends, only the curator receives, and
   the curator has no mail tool — so there is no relay loop to cut and `hop` is provenance the model
-  reads. The router is where a `hop >= 2` refusal would go in a program where two AIs can both send.
+  reads. The route has no opinion about it either: a `hop >= 2` refusal is routing *policy*, which a
+  program with one writes over the [mechanism layer](https://katari-lang.dev/packages/ai) the route is
+  built from.
 - **Nothing escalates to a human.** `katari check` reports the run's only unhandled requests as
   the store's four operations and `io`, which the runtime answers itself — so the concierge never
   parks waiting for an answer.
