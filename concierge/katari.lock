@@ -1,22 +1,22 @@
 [lock]
 version = 1
-snapshot = "snapshot-2026-07-31-59401211"
-katari_compiler = "0.1.4"
+snapshot = "snapshot-2026-08-02-a21d858c"
+katari_compiler = "0.1.6"
 
 [packages.ai]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-ai"
-rev = "de9084ff05a213ae7a278489f2ea35d8339693d9"
-sha256 = "a0f71ea43f2065bfdfee35906ff12cf490a638a4b2777f736f046f1a0c4e821a"
+rev = "4d22d019d1b1c6f5322b9bb8b900c09fdf24c1db"
+sha256 = "f9e39129c2aefc8640b0f41365efd171a86bd73fa855f4cd0807c76d2d1afde8"
 
 [packages.discord]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-discord"
-rev = "3ac5f4637486699c6174e271834f28e00eabb984"
-sha256 = "9365575165ed3827a185b2780558e50ddab1fb69718b6db6fec9af64c2e94afc"
+rev = "ac2b88af31e378f73878577d938310551de701a8"
+sha256 = "2aa7413f57fb2eba5ed119a9503c0fec881a524331ec5d45762322e9024fc838"
 
 [packages.memory]
 source = "git"
 url = "https://github.com/katari-lang/katari-package-memory"
-rev = "cbf3af09804230d466d8037ad39bee3f569e0938"
-sha256 = "febe671d52cb6199decac26a07d34a3371fa6d6e1041879d85f15a6b5c945663"
+rev = "8e67530e19b70220aeaf67016cdf42471990041f"
+sha256 = "02f55d4c38f127e1f992674f60ec9fe6daee2d4417b12cc645e19f6e01068d78"
